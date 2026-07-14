@@ -15,9 +15,12 @@ class HunterConfigTest {
         when(preferences.getBoolean("jsSecretHunter.targetScopeOnly")).thenReturn(null);
         HunterConfig config = HunterConfig.load(preferences);
         assertEquals(ScanScope.TARGET_SCOPE, config.scanScope());
+        org.junit.jupiter.api.Assertions.assertFalse(config.annotateHistory());
         config.scanScope(ScanScope.ALL_TRAFFIC);
+        config.annotateHistory(true);
         config.save(preferences);
         verify(preferences).setBoolean("jsSecretHunter.targetScopeOnly", false);
+        verify(preferences).setBoolean("jsSecretHunter.annotateHistory", true);
     }
 
     @Test

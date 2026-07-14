@@ -21,6 +21,15 @@ class ScannerContentTest {
         assertEquals(ContentClass.BINARY, classify("application/octet-stream", "https://app.test/image"));
     }
 
+    @Test
+    void removesOnlyExtensionOwnedHistoryNoteSegments() {
+        assertEquals("analyst note", ScannerService.stripHunterNote(
+                "analyst note | [JS Secret Hunter] HIGH - 3 candidate(s)"));
+        assertEquals("before | after", ScannerService.stripHunterNote(
+                "before | [JS Secret Hunter] MEDIUM - 1 candidate(s) | after"));
+        assertEquals("", ScannerService.stripHunterNote("[JS Secret Hunter] INFO - 2 candidate(s)"));
+    }
+
     private ContentClass classify(String contentType, String url) {
         HttpResponse response = mock(HttpResponse.class);
         when(response.hasHeader("Content-Type")).thenReturn(true);

@@ -1,5 +1,5 @@
 Uuid: 7bd7b88f-42c2-4f5c-bd15-faf712524c59
 ExtensionType: 1
-EntryPoint: build/libs/js-secret-hunter-1.1.0.jar
+EntryPoint: build/libs/js-secret-hunter-1.1.1.jar
 BuildCommand: ./gradlew clean test jar
 BurpVersion: 2026.4

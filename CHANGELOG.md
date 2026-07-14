@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 - 2026-07-14
+
+- Added a dedicated Links tab for endpoint and configuration discoveries.
+- Disabled Proxy History note annotations by default and made them an explicit setting.
+- Remove stale JS Secret Hunter note segments during rescans while preserving analyst notes.
+- Show a clear status message when Target Scope contains no matching Proxy history responses.
+
 ## 1.1.0 - 2026-07-14
 
 - Fixed clipped and apparently unresponsive Findings actions with a responsive action grid and explicit selection states.

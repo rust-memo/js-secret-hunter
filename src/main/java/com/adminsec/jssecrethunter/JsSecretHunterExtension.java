@@ -44,7 +44,7 @@ public final class JsSecretHunterExtension implements BurpExtension {
         registerContextMenu();
         api.proxy().registerResponseHandler(new LiveProxyHandler());
         api.extension().registerUnloadingHandler(scanner::shutdown);
-        api.logging().logToOutput(NAME + " 1.1.0 loaded. Automatic fetches are restricted to Target Scope.");
+        api.logging().logToOutput(NAME + " 1.1.1 loaded. Results stay in the extension; optional Proxy notes are disabled by default.");
         api.logging().logToOutput("Active rules: " + rules.current().version() + " (" + rules.current().rules().size() + ", SHA-256 " + rules.current().shortHash() + "…)" );
         scanner.scanHistory();
     }

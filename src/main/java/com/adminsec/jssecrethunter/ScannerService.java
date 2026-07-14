@@ -36,9 +36,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 public final class ScannerService {
     private static final String NOTE = "[JS Secret Hunter]";
+    private static final Pattern NOTE_SEPARATOR = Pattern.compile("\\s*\\|\\s*");
     private static final Set<String> CREDENTIAL_HEADERS = Set.of("cookie", "authorization");
     private static final Set<String> CONTEXT_HEADERS = Set.of("user-agent", "accept-language");
     private final MontoyaApi api;
@@ -96,6 +98,7 @@ public final class ScannerService {
         if (generation != epoch.get() || stopping.get()) return;
         historyScanning.set(true); stateMessage = "Reading Proxy history"; publishState();
         try {
+            cleanupOwnedHistoryNotes(generation);
             List<ProxyHttpRequestResponse> history = api.proxy().history(item -> item.finalRequest() != null && item.hasResponse()
                     && (config.scanScope() == ScanScope.ALL_TRAFFIC || inScope(item.finalRequest())));
             int total = history.size();
@@ -103,18 +106,38 @@ public final class ScannerService {
                 history = new ArrayList<>(history.subList(total - config.maxHistoryEntries(), total));
                 stateMessage = "Scanning the newest " + history.size() + " of " + total + " matching history entries";
             }
+            if (history.isEmpty()) {
+                stateMessage = config.scanScope() == ScanScope.TARGET_SCOPE
+                        ? "No in-scope history responses. Add the target to Target Scope or disable scope-only analysis in Settings."
+                        : "No matching responses were found in Proxy history.";
+            }
             for (ProxyHttpRequestResponse item : history) {
                 if (stopping.get() || generation != epoch.get()) return;
                 if (!waitIfPaused(generation)) return;
                 observeInternal(item.finalRequest(), item.response(), item.annotations(), generation, true);
             }
-            stateMessage = "Queued " + history.size() + " history entries";
+            if (!history.isEmpty()) stateMessage = "Queued " + history.size() + " history entries";
             api.logging().logToOutput("JS Secret Hunter: queued history scan for " + history.size() + " entries.");
         } catch (RuntimeException error) {
             stateMessage = "History scan failed: " + safeMessage(error);
             api.logging().logToError("JS Secret Hunter history scan failed", error);
         } finally {
             historyScanning.set(false); publishState();
+        }
+    }
+
+    private void cleanupOwnedHistoryNotes(long generation) {
+        if (generation != epoch.get() || stopping.get()) return;
+        stateMessage = "Cleaning previous JS Secret Hunter notes"; publishState();
+        List<ProxyHttpRequestResponse> annotated = api.proxy().history(item -> {
+            try {
+                return item.annotations() != null && item.annotations().hasNotes()
+                        && item.annotations().notes() != null && item.annotations().notes().contains(NOTE);
+            } catch (RuntimeException unavailable) { return false; }
+        });
+        for (ProxyHttpRequestResponse item : annotated) {
+            if (generation != epoch.get() || stopping.get()) return;
+            removeHunterNote(item.annotations());
         }
     }
 
@@ -139,7 +162,12 @@ public final class ScannerService {
         String url = canonical(request.url());
         Observed stored = temporaryObserved(request, response);
         observedCache.put(url, stored); trimCache(observedCache, config.maxHistoryEntries() * 2);
-        if (annotations != null) { rootAnnotations.putIfAbsent(url, annotations); trimCache(rootAnnotations, config.maxHistoryEntries()); }
+        if (annotations != null) {
+            removeHunterNote(annotations);
+            if (config.annotateHistory()) {
+                rootAnnotations.putIfAbsent(url, annotations); trimCache(rootAnnotations, config.maxHistoryEntries());
+            }
+        }
         submitWorker(() -> process(new Work(url, url, url, 0, List.of(url), stored.request, stored.response, generation, expand, null)));
     }
 
@@ -326,19 +354,35 @@ public final class ScannerService {
     }
 
     private void annotate(String rootUrl, List<Finding> findings) {
-        if (findings.isEmpty()) return;
+        if (findings.isEmpty() || !config.annotateHistory()) return;
         Annotations annotations = rootAnnotations.get(rootUrl);
         if (annotations == null) return;
         Severity highest = findings.stream().map(Finding::severity).min(Comparator.comparingInt(Severity::rank)).orElse(Severity.INFO);
         String summary = NOTE + " " + highest + " - " + findings.size() + " candidate(s)";
-        if (!annotations.hasNotes() || !annotations.notes().contains(NOTE)) {
-            annotations.setNotes(annotations.hasNotes() && !annotations.notes().isBlank() ? annotations.notes() + " | " + summary : summary);
-        }
+        String existing = stripHunterNote(annotations.notes());
+        annotations.setNotes(existing.isBlank() ? summary : existing + " | " + summary);
         if (!annotations.hasHighlightColor() || annotations.highlightColor() == HighlightColor.NONE) {
             annotations.setHighlightColor(switch (highest) {
                 case CRITICAL, HIGH -> HighlightColor.RED; case MEDIUM -> HighlightColor.ORANGE; case INFO -> HighlightColor.CYAN;
             });
         }
+    }
+
+    static String stripHunterNote(String notes) {
+        if (notes == null || notes.isBlank()) return "";
+        List<String> retained = new ArrayList<>();
+        for (String part : NOTE_SEPARATOR.split(notes.trim())) {
+            String value = part.trim();
+            if (!value.isBlank() && !value.startsWith(NOTE)) retained.add(value);
+        }
+        return String.join(" | ", retained);
+    }
+
+    private static void removeHunterNote(Annotations annotations) {
+        if (annotations == null || !annotations.hasNotes()) return;
+        String notes = annotations.notes();
+        String cleaned = stripHunterNote(notes);
+        if (notes != null && !notes.equals(cleaned)) annotations.setNotes(cleaned);
     }
 
     public void pause() { paused.set(true); stateMessage = "Paused"; publishState(); }

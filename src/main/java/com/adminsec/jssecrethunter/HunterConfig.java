@@ -16,6 +16,7 @@ public final class HunterConfig {
     private int perHost = 2;
     private int timeoutSeconds = 15;
     private ScanScope scanScope = ScanScope.TARGET_SCOPE;
+    private boolean annotateHistory;
 
     public static HunterConfig load(Preferences p) {
         HunterConfig c = new HunterConfig();
@@ -31,6 +32,7 @@ public final class HunterConfig {
         c.perHost = integer(p, "perHost", 2, 1, 8);
         c.timeoutSeconds = integer(p, "timeout", 15, 3, 120);
         c.scanScope = bool(p, "targetScopeOnly", true) ? ScanScope.TARGET_SCOPE : ScanScope.ALL_TRAFFIC;
+        c.annotateHistory = bool(p, "annotateHistory", false);
         return c;
     }
 
@@ -47,6 +49,7 @@ public final class HunterConfig {
         p.setInteger(PREFIX + "perHost", perHost);
         p.setInteger(PREFIX + "timeout", timeoutSeconds);
         p.setBoolean(PREFIX + "targetScopeOnly", scanScope == ScanScope.TARGET_SCOPE);
+        p.setBoolean(PREFIX + "annotateHistory", annotateHistory);
     }
 
     private static boolean bool(Preferences p, String key, boolean fallback) {
@@ -80,4 +83,6 @@ public final class HunterConfig {
     public void timeoutSeconds(int v) { timeoutSeconds = Math.max(3, Math.min(120, v)); }
     public ScanScope scanScope() { return scanScope; }
     public void scanScope(ScanScope value) { scanScope = value == null ? ScanScope.TARGET_SCOPE : value; }
+    public boolean annotateHistory() { return annotateHistory; }
+    public void annotateHistory(boolean value) { annotateHistory = value; }
 }
