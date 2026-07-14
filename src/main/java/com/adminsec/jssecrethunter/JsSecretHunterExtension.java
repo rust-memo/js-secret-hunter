@@ -8,6 +8,14 @@ import burp.api.montoya.proxy.http.InterceptedResponse;
 import burp.api.montoya.proxy.http.ProxyResponseHandler;
 import burp.api.montoya.proxy.http.ProxyResponseReceivedAction;
 import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction;
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
+import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
+
+import javax.swing.JMenuItem;
+import java.awt.Component;
+import java.util.ArrayList;
+import java.util.List;
 
 public final class JsSecretHunterExtension implements BurpExtension {
     private static final String NAME = "JS Secret Hunter";
@@ -28,16 +36,39 @@ public final class JsSecretHunterExtension implements BurpExtension {
         }
         RulePackManager rules = new RulePackManager();
         loadCustomRules(rules);
-        HunterRepository repository = new HunterRepository(projectData);
+        HunterRepository repository = new HunterRepository(projectData, config.maxFindings());
         DetectionEngine detector = new DetectionEngine(rules);
         scanner = new ScannerService(api, config, repository, detector);
         HunterPanel panel = new HunterPanel(api, config, repository, rules, scanner, pack -> persistRules(rules, pack));
         api.userInterface().registerSuiteTab("JS Secret Hunter", panel);
+        registerContextMenu();
         api.proxy().registerResponseHandler(new LiveProxyHandler());
         api.extension().registerUnloadingHandler(scanner::shutdown);
-        api.logging().logToOutput(NAME + " 1.0.0 loaded. Automatic fetches are restricted to Target Scope.");
+        api.logging().logToOutput(NAME + " 1.1.0 loaded. Automatic fetches are restricted to Target Scope.");
         api.logging().logToOutput("Active rules: " + rules.current().version() + " (" + rules.current().rules().size() + ", SHA-256 " + rules.current().shortHash() + "…)" );
         scanner.scanHistory();
+    }
+
+    private void registerContextMenu() {
+        api.userInterface().registerContextMenuItemsProvider(new ContextMenuItemsProvider() {
+            @Override
+            public List<Component> provideMenuItems(ContextMenuEvent event) {
+                List<HttpRequestResponse> messages = new ArrayList<>(event.selectedRequestResponses());
+                event.messageEditorRequestResponse().map(value -> value.requestResponse()).ifPresent(message -> {
+                    if (!messages.contains(message)) messages.add(message);
+                });
+                messages.removeIf(message -> message == null || !message.hasResponse());
+                if (messages.isEmpty()) return List.of();
+                JMenuItem item = new JMenuItem(messages.size() == 1
+                        ? "Scan with JS Secret Hunter" : "Scan " + messages.size() + " messages with JS Secret Hunter");
+                item.addActionListener(ignored -> {
+                    int queued = 0;
+                    for (HttpRequestResponse message : messages) if (scanner.scanSelected(message)) queued++;
+                    api.logging().logToOutput("JS Secret Hunter: queued " + queued + " selected message(s) for analysis.");
+                });
+                return List.of(item);
+            }
+        });
     }
 
     private void loadCustomRules(RulePackManager rules) {

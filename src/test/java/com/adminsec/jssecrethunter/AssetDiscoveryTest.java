@@ -33,4 +33,22 @@ class AssetDiscoveryTest {
         assertNull(AssetDiscovery.resolve("https://a.test/app.js", "https://user:pass@a.test/private.js"));
         assertEquals("https://a.test/x.js?v=1", AssetDiscovery.resolve("https://a.test/app.js", "/x.js?v=1#frag"));
     }
+
+    @Test
+    void preservesScriptTypeForExtensionlessAssets() {
+        Set<DiscoveredAsset> assets = discovery.discoverAssets("https://app.test/page",
+                "<script src='/bundle?v=3'></script><link rel='modulepreload' href='/module'>", true, false);
+        assertTrue(assets.stream().anyMatch(asset -> asset.url().equals("https://app.test/bundle?v=3")
+                && asset.contentClass() == ContentClass.JAVASCRIPT));
+        assertTrue(assets.stream().anyMatch(asset -> asset.url().equals("https://app.test/module")
+                && asset.contentClass() == ContentClass.JAVASCRIPT));
+    }
+
+    @Test
+    void doesNotTurnBareModuleSpecifiersIntoNetworkPaths() {
+        Set<DiscoveredAsset> assets = discovery.discoverAssets("https://app.test/assets/app.js",
+                "import React from 'react'; import('./runtime');", false, true);
+        assertTrue(assets.stream().anyMatch(asset -> asset.url().equals("https://app.test/assets/runtime")));
+        assertFalse(assets.stream().anyMatch(asset -> asset.url().equals("https://app.test/assets/react")));
+    }
 }

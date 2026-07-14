@@ -30,6 +30,7 @@ public final class Finding {
     private final HttpRequest request;
     private final HttpResponse response;
     private volatile ReviewStatus reviewStatus = ReviewStatus.NEEDS_REVIEW;
+    private volatile boolean published;
 
     public Finding(String ruleId, String ruleName, FindingKind kind, Severity severity, Confidence confidence,
                    String assetUrl, String rootUrl, List<String> discoveryChain, int line, int start, int end,
@@ -86,4 +87,6 @@ public final class Finding {
     public HttpResponse response() { return response; }
     public ReviewStatus reviewStatus() { return reviewStatus; }
     public void reviewStatus(ReviewStatus value) { reviewStatus = Objects.requireNonNull(value); }
+    public boolean published() { return published; }
+    public void published(boolean value) { published = value; }
 }

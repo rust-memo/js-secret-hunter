@@ -18,5 +18,5 @@ public record AssetRecord(
         HttpResponse response,
         Instant observedAt) {
 
-    public enum AssetStatus { QUEUED, FETCHING, SCANNED, SKIPPED, FAILED }
+    public enum AssetStatus { QUEUED, FETCHING, SCANNED, SKIPPED, FAILED, CANCELLED }
 }

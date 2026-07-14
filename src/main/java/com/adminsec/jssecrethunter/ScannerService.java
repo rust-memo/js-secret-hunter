@@ -6,13 +6,15 @@ import burp.api.montoya.core.HighlightColor;
 import burp.api.montoya.http.RedirectionMode;
 import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
-import burp.api.montoya.http.message.MimeType;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 import com.adminsec.jssecrethunter.model.AssetRecord;
 import com.adminsec.jssecrethunter.model.Finding;
 import com.adminsec.jssecrethunter.model.Severity;
+
+import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 
 import java.net.URI;
 import java.time.Instant;
@@ -25,13 +27,15 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 public final class ScannerService {
     private static final String NOTE = "[JS Secret Hunter]";
@@ -45,17 +49,23 @@ public final class ScannerService {
     private final ThreadPoolExecutor workers;
     private final ExecutorService coordinator;
     private final ScheduledThreadPoolExecutor scheduler;
-    private final Map<String, ProxyHttpRequestResponse> historyIndex = new ConcurrentHashMap<>();
     private final Map<String, Observed> observedCache = new ConcurrentHashMap<>();
     private final Map<String, Semaphore> hostLimits = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rootCounts = new ConcurrentHashMap<>();
     private final Map<String, Annotations> rootAnnotations = new ConcurrentHashMap<>();
+    private final Set<String> discoveredPerRoot = ConcurrentHashMap.newKeySet();
     private final Set<String> scheduled = ConcurrentHashMap.newKeySet();
     private final Set<String> processed = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean paused = new AtomicBoolean(false);
     private final AtomicBoolean stopping = new AtomicBoolean(false);
     private final AtomicBoolean historyScanning = new AtomicBoolean(false);
+    private final AtomicInteger inFlight = new AtomicInteger();
+    private final AtomicLong scanned = new AtomicLong();
     private final AtomicLong epoch = new AtomicLong();
+    private final AtomicLong stateVersion = new AtomicLong();
+    private final AtomicBoolean stateNotificationPending = new AtomicBoolean();
+    private volatile Consumer<ScanState> stateListener = ignored -> {};
+    private volatile String stateMessage = "Idle";
 
     public ScannerService(MontoyaApi api, HunterConfig config, HunterRepository repository, DetectionEngine detector) {
         this.api = api; this.config = config; this.repository = repository; this.detector = detector;
@@ -65,142 +75,212 @@ public final class ScannerService {
         scheduler.setRemoveOnCancelPolicy(true);
     }
 
-    public void scanHistory() {
-        if (!historyScanning.compareAndSet(false, true)) {
-            api.logging().logToOutput("JS Secret Hunter: history scan is already running."); return;
+    public void stateListener(Consumer<ScanState> listener) {
+        stateListener = listener == null ? ignored -> {} : listener;
+        publishState();
+    }
+
+    public void scanHistory() { submitHistoryScan(epoch.get()); }
+
+    public void restartHistoryScan() {
+        long generation = beginNewGeneration(true, "Restarting history scan");
+        submitHistoryScan(generation);
+    }
+
+    private void submitHistoryScan(long generation) {
+        try { coordinator.submit(() -> scanHistory(generation)); }
+        catch (RejectedExecutionException ignored) { }
+    }
+
+    private void scanHistory(long generation) {
+        if (generation != epoch.get() || stopping.get()) return;
+        historyScanning.set(true); stateMessage = "Reading Proxy history"; publishState();
+        try {
+            List<ProxyHttpRequestResponse> history = api.proxy().history(item -> item.finalRequest() != null && item.hasResponse()
+                    && (config.scanScope() == ScanScope.ALL_TRAFFIC || inScope(item.finalRequest())));
+            int total = history.size();
+            if (total > config.maxHistoryEntries()) {
+                history = new ArrayList<>(history.subList(total - config.maxHistoryEntries(), total));
+                stateMessage = "Scanning the newest " + history.size() + " of " + total + " matching history entries";
+            }
+            for (ProxyHttpRequestResponse item : history) {
+                if (stopping.get() || generation != epoch.get()) return;
+                if (!waitIfPaused(generation)) return;
+                observeInternal(item.finalRequest(), item.response(), item.annotations(), generation, true);
+            }
+            stateMessage = "Queued " + history.size() + " history entries";
+            api.logging().logToOutput("JS Secret Hunter: queued history scan for " + history.size() + " entries.");
+        } catch (RuntimeException error) {
+            stateMessage = "History scan failed: " + safeMessage(error);
+            api.logging().logToError("JS Secret Hunter history scan failed", error);
+        } finally {
+            historyScanning.set(false); publishState();
         }
-        coordinator.submit(() -> {
-            try {
-                List<ProxyHttpRequestResponse> history = api.proxy().history(item -> item.finalRequest() != null);
-                for (ProxyHttpRequestResponse item : history) historyIndex.put(canonical(item.finalRequest().url()), item);
-                for (ProxyHttpRequestResponse item : history) {
-                    if (stopping.get()) return;
-                    waitIfPaused();
-                    if (item.hasResponse()) observe(item.finalRequest(), item.response(), item.annotations());
-                }
-                api.logging().logToOutput("JS Secret Hunter: queued history scan for " + history.size() + " entries.");
-            } catch (RuntimeException error) { api.logging().logToError("JS Secret Hunter history scan failed", error); }
-            finally { historyScanning.set(false); }
-        });
     }
 
     public void observe(HttpRequest request, HttpResponse response, Annotations annotations) {
         if (request == null || response == null || stopping.get()) return;
+        if (config.scanScope() == ScanScope.TARGET_SCOPE && !inScope(request)) return;
+        observeInternal(request, response, annotations, epoch.get(), true);
+    }
+
+    public boolean scanSelected(HttpRequestResponse message) {
+        if (message == null || !message.hasResponse() || message.request() == null || message.response() == null) return false;
+        boolean expand = inScope(message.request());
+        observeInternal(message.request(), message.response(), message.annotations(), epoch.get(), expand);
+        stateMessage = expand ? "Queued selected message" : "Queued selected message for local-only analysis";
+        publishState();
+        return true;
+    }
+
+    private void observeInternal(HttpRequest request, HttpResponse response, Annotations annotations,
+                                 long generation, boolean expand) {
+        if (generation != epoch.get() || stopping.get()) return;
         String url = canonical(request.url());
-        observedCache.put(url, new Observed(request, response));
-        rootAnnotations.putIfAbsent(url, annotations);
-        workers.submit(() -> process(new Work(url, url, url, 0, List.of(url), request, response, true, epoch.get())));
+        Observed stored = temporaryObserved(request, response);
+        observedCache.put(url, stored); trimCache(observedCache, config.maxHistoryEntries() * 2);
+        if (annotations != null) { rootAnnotations.putIfAbsent(url, annotations); trimCache(rootAnnotations, config.maxHistoryEntries()); }
+        submitWorker(() -> process(new Work(url, url, url, 0, List.of(url), stored.request, stored.response, generation, expand, null)));
+    }
+
+    private void submitWorker(Runnable action) {
+        try {
+            workers.submit(() -> {
+                inFlight.incrementAndGet(); publishState();
+                try { action.run(); }
+                catch (RuntimeException error) { api.logging().logToError("JS Secret Hunter background task failed", error); }
+                finally { inFlight.decrementAndGet(); publishState(); }
+            });
+            publishState();
+        } catch (RejectedExecutionException ignored) { }
     }
 
     private void process(Work work) {
-        if (stopping.get() || work.epoch != epoch.get()) return;
-        waitIfPaused();
+        if (stopping.get() || work.epoch != epoch.get() || !waitIfPaused(work.epoch)) return;
         String processKey = work.rootUrl + "\n" + canonical(work.url) + "\n" + work.response.statusCode() + "\n" + work.response.body().length();
         if (!processed.add(processKey)) return;
-        int limit = AssetDiscovery.isSourceMapUrl(work.url) ? config.maxMapBytes() : config.maxJsBytes();
-        boolean script = isJavaScript(work.request, work.response, work.url);
-        boolean map = AssetDiscovery.isSourceMapUrl(work.url);
-        boolean html = isHtml(work.response, work.url);
-        boolean textual = script || map || html || isTextual(work.response);
-        if (!textual) {
-            repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SKIPPED, "Non-text response")); return;
-        }
-        String body = TextBody.decode(work.response, limit);
-        if (body == null) {
-            repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SKIPPED, "Unsupported encoding or size limit")); return;
-        }
-        List<Finding> findings = (script || map || html)
-                ? detector.scan(body, work.url, work.rootUrl, work.chain, work.request, work.response) : List.of();
-        repository.addFindings(findings);
-        repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SCANNED,
-                findings.size() + " findings; " + body.length() + " chars"));
-        annotate(work.rootUrl, findings);
-
-        if (work.depth >= config.maxDepth()) return;
-        Set<String> links = discovery.discover(work.url, body, html, script || map);
-        for (String link : links) scheduleLink(work, link);
-    }
-
-    private void scheduleLink(Work parent, String link) {
-        if (!AssetDiscovery.isJavaScriptUrl(link) && !AssetDiscovery.isSourceMapUrl(link)) return;
-        AtomicInteger count = rootCounts.computeIfAbsent(parent.rootUrl, ignored -> new AtomicInteger());
-        if (count.incrementAndGet() > config.maxAssetsPerRoot()) return;
-        List<String> chain = new ArrayList<>(parent.chain); chain.add(link);
-        ProxyHttpRequestResponse existing = historyIndex.get(canonical(link));
-        if (existing != null && existing.hasResponse()) {
-            process(new Work(link, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                    existing.finalRequest(), existing.response(), false, parent.epoch));
+        ContentClass contentClass = classify(work.request, work.response, work.url, work.hint);
+        if (contentClass == ContentClass.BINARY) {
+            if (work.epoch == epoch.get()) repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SKIPPED, "Non-text response"), work.epoch);
             return;
         }
-        Observed observed = observedCache.get(canonical(link));
+        int limit = switch (contentClass) {
+            case SOURCE_MAP -> config.maxMapBytes();
+            case JAVASCRIPT -> config.maxJsBytes();
+            default -> config.maxTextBytes();
+        };
+        String body = TextBody.decode(work.response, limit);
+        if (body == null) {
+            if (work.epoch == epoch.get()) repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SKIPPED, "Unsupported encoding or size limit"), work.epoch);
+            return;
+        }
+
+        if (work.epoch != epoch.get()) return;
+        List<Finding> findings = detector.scan(body, work.url, work.rootUrl, work.chain, work.request, work.response);
+        if (work.epoch != epoch.get()) return;
+        repository.addFindings(findings, work.epoch);
+        repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SCANNED,
+                findings.size() + " findings; " + body.length() + " chars; " + contentClass.name().toLowerCase(Locale.ROOT)), work.epoch);
+        scanned.incrementAndGet(); annotate(work.rootUrl, findings); publishState();
+
+        if (!work.expand || work.depth >= config.maxDepth()) return;
+        boolean html = contentClass == ContentClass.HTML;
+        boolean javascript = contentClass == ContentClass.JAVASCRIPT || contentClass == ContentClass.SOURCE_MAP;
+        if (!html && !javascript) return;
+        for (DiscoveredAsset link : discovery.discoverAssets(work.url, body, html, javascript)) scheduleLink(work, link);
+    }
+
+    private Observed temporaryObserved(HttpRequest request, HttpResponse response) {
+        try {
+            HttpRequestResponse stored = HttpRequestResponse.httpRequestResponse(request, response).copyToTempFile();
+            return new Observed(stored.request(), stored.response());
+        } catch (RuntimeException unavailable) { return new Observed(request, response); }
+    }
+
+    private void scheduleLink(Work parent, DiscoveredAsset link) {
+        if (parent.epoch != epoch.get() || stopping.get()) return;
+        String canonical = canonical(link.url());
+        String rootKey = parent.rootUrl + "\n" + canonical;
+        if (!discoveredPerRoot.add(rootKey)) return;
+        AtomicInteger count = rootCounts.computeIfAbsent(parent.rootUrl, ignored -> new AtomicInteger());
+        if (count.incrementAndGet() > config.maxAssetsPerRoot()) return;
+        List<String> chain = new ArrayList<>(parent.chain); chain.add(link.url());
+        Observed observed = observedCache.get(canonical);
         if (observed != null) {
-            process(new Work(link, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                    observed.request, observed.response, false, parent.epoch));
+            process(new Work(link.url(), parent.url, parent.rootUrl, parent.depth + 1, chain,
+                    observed.request, observed.response, parent.epoch, true, link.contentClass()));
             return;
         }
         if (!config.autoFetch()) return;
         HttpRequest scopeProbe;
-        try { scopeProbe = HttpRequest.httpRequestFromUrl(link); }
+        try { scopeProbe = HttpRequest.httpRequestFromUrl(link.url()); }
         catch (RuntimeException invalid) { return; }
-        if (!scopeProbe.isInScope()) {
-            repository.upsertAsset(new AssetRecord(link, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                    AssetRecord.AssetStatus.SKIPPED, "Outside Target Scope", scopeProbe, null, Instant.now()));
+        if (!inScope(scopeProbe)) {
+            if (parent.epoch != epoch.get()) return;
+            repository.upsertAsset(new AssetRecord(link.url(), parent.url, parent.rootUrl, parent.depth + 1, chain,
+                    AssetRecord.AssetStatus.SKIPPED, "Outside Target Scope", scopeProbe, null, Instant.now()), parent.epoch);
             return;
         }
-        String key = canonical(link);
-        if (!scheduled.add(key)) return;
-        repository.upsertAsset(new AssetRecord(link, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                AssetRecord.AssetStatus.QUEUED, "Waiting for background fetch", scopeProbe, null, Instant.now()));
+        if (!scheduled.add(rootKey)) return;
+        if (parent.epoch != epoch.get()) { scheduled.remove(rootKey); return; }
+        repository.upsertAsset(new AssetRecord(link.url(), parent.url, parent.rootUrl, parent.depth + 1, chain,
+                AssetRecord.AssetStatus.QUEUED, link.source() + "; waiting for background fetch", scopeProbe, null, Instant.now()), parent.epoch);
         scheduler.schedule(() -> {
             if (parent.epoch != epoch.get()) return;
-            Observed late = observedCache.get(canonical(link));
+            Observed late = observedCache.get(canonical);
             if (late != null) {
-                workers.submit(() -> process(new Work(link, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                        late.request, late.response, false, parent.epoch)));
+                submitWorker(() -> process(new Work(link.url(), parent.url, parent.rootUrl, parent.depth + 1, chain,
+                        late.request, late.response, parent.epoch, true, link.contentClass())));
             } else {
-                workers.submit(() -> fetch(link, parent, chain, 0));
+                submitWorker(() -> fetch(link.url(), parent, chain, 0, link.contentClass()));
             }
         }, 500, TimeUnit.MILLISECONDS);
+        publishState();
     }
 
-    private void fetch(String url, Work parent, List<String> chain, int redirects) {
-        waitIfPaused();
-        if (stopping.get() || parent.epoch != epoch.get()) return;
+    private void fetch(String url, Work parent, List<String> chain, int redirects, ContentClass hint) {
+        if (!waitIfPaused(parent.epoch) || stopping.get() || parent.epoch != epoch.get()) return;
         HttpRequest request = requestFor(url, parent.request);
-        if (!request.isInScope()) return;
+        if (!inScope(request)) return;
         Semaphore limit = hostLimits.computeIfAbsent(host(url), ignored -> new Semaphore(config.perHost()));
         boolean acquired = false;
         try {
             limit.acquire(); acquired = true;
+            if (parent.epoch != epoch.get()) return;
             repository.upsertAsset(new AssetRecord(url, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                    AssetRecord.AssetStatus.FETCHING, "GET in progress", request, null, Instant.now()));
+                    AssetRecord.AssetStatus.FETCHING, "GET in progress", request, null, Instant.now()), parent.epoch);
             HttpRequestResponse rr = api.http().sendRequest(request, RequestOptions.requestOptions()
                     .withRedirectionMode(RedirectionMode.NEVER).withResponseTimeout(config.timeoutSeconds() * 1000L));
             if (parent.epoch != epoch.get()) return;
             if (rr == null || !rr.hasResponse()) {
                 repository.upsertAsset(new AssetRecord(url, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                        AssetRecord.AssetStatus.FAILED, "No response", request, null, Instant.now())); return;
+                        AssetRecord.AssetStatus.FAILED, "No response", request, null, Instant.now()), parent.epoch); return;
             }
             HttpResponse response = rr.response();
             if (response.statusCode() >= 300 && response.statusCode() < 400 && response.hasHeader("Location") && redirects < 3) {
                 String target = AssetDiscovery.resolve(url, response.headerValue("Location"));
                 if (target != null) {
                     HttpRequest probe = HttpRequest.httpRequestFromUrl(target);
-                    if (probe.isInScope()) {
+                    if (inScope(probe)) {
                         List<String> redirected = new ArrayList<>(chain); redirected.add(target);
                         limit.release(); acquired = false;
-                        fetch(target, new Work(url, parent.url, parent.rootUrl, parent.depth, chain, request, response, false, parent.epoch), redirected, redirects + 1);
+                        fetch(target, new Work(url, parent.url, parent.rootUrl, parent.depth, chain,
+                                request, response, parent.epoch, true, hint), redirected, redirects + 1, hint);
                         return;
                     }
                 }
             }
-            observedCache.put(canonical(url), new Observed(request, response));
-            process(new Work(url, parent.url, parent.rootUrl, parent.depth + 1, chain, request, response, false, parent.epoch));
+            HttpRequestResponse stored = rr.copyToTempFile();
+            observedCache.put(canonical(url), new Observed(stored.request(), stored.response()));
+            process(new Work(url, parent.url, parent.rootUrl, parent.depth + 1, chain,
+                    stored.request(), stored.response(), parent.epoch, true, hint));
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         } catch (RuntimeException error) {
-            repository.upsertAsset(new AssetRecord(url, parent.url, parent.rootUrl, parent.depth + 1, chain,
-                    AssetRecord.AssetStatus.FAILED, safeMessage(error), request, null, Instant.now()));
+            if (parent.epoch == epoch.get()) {
+                repository.upsertAsset(new AssetRecord(url, parent.url, parent.rootUrl, parent.depth + 1, chain,
+                        AssetRecord.AssetStatus.FAILED, safeMessage(error), request, null, Instant.now()), parent.epoch);
+            }
             api.logging().logToError("JS asset fetch failed for " + url + ": " + safeMessage(error));
         } finally { if (acquired) limit.release(); }
     }
@@ -214,7 +294,7 @@ public final class ScannerService {
                 target = target.withUpdatedHeader(header.name(), header.value());
             }
         }
-        return target.withUpdatedHeader("Accept", "application/javascript, text/javascript, application/json, */*;q=0.8");
+        return target.withUpdatedHeader("Accept", "application/javascript, text/javascript, application/json, text/*, */*;q=0.8");
     }
 
     static boolean sameOrigin(String left, String right) {
@@ -223,6 +303,26 @@ public final class ScannerService {
             return a.getScheme().equalsIgnoreCase(b.getScheme()) && a.getHost().equalsIgnoreCase(b.getHost())
                     && effectivePort(a) == effectivePort(b);
         } catch (RuntimeException error) { return false; }
+    }
+
+    static ContentClass classify(HttpRequest req, HttpResponse res, String url) {
+        return classify(req, res, url, null);
+    }
+
+    private static ContentClass classify(HttpRequest req, HttpResponse res, String url, ContentClass hint) {
+        if (AssetDiscovery.isSourceMapUrl(url)) return ContentClass.SOURCE_MAP;
+        String mime = res.mimeType() == null ? "" : res.mimeType().toString().toLowerCase(Locale.ROOT);
+        String contentType = res.hasHeader("Content-Type") && res.headerValue("Content-Type") != null
+                ? res.headerValue("Content-Type").toLowerCase(Locale.ROOT) : "";
+        String path = url.toLowerCase(Locale.ROOT).split("[?#]", 2)[0];
+        if (hint == ContentClass.SOURCE_MAP) return ContentClass.SOURCE_MAP;
+        if (hint == ContentClass.JAVASCRIPT || AssetDiscovery.isJavaScriptUrl(url) || mime.contains("script") || mime.contains("javascript")
+                || contentType.contains("javascript") || contentType.contains("ecmascript")) return ContentClass.JAVASCRIPT;
+        if (mime.contains("html") || contentType.contains("html") || path.endsWith(".html") || path.endsWith(".htm")) return ContentClass.HTML;
+        if (mime.contains("json") || contentType.contains("json") || path.endsWith(".json")) return ContentClass.JSON;
+        if (mime.contains("xml") || contentType.contains("xml") || path.endsWith(".xml")) return ContentClass.XML;
+        if (mime.contains("text") || contentType.startsWith("text/")) return ContentClass.TEXT;
+        return ContentClass.BINARY;
     }
 
     private void annotate(String rootUrl, List<Finding> findings) {
@@ -241,45 +341,85 @@ public final class ScannerService {
         }
     }
 
-    public void pause() { paused.set(true); }
-    public void resume() { paused.set(false); synchronized (paused) { paused.notifyAll(); } }
+    public void pause() { paused.set(true); stateMessage = "Paused"; publishState(); }
+    public void resume() { paused.set(false); synchronized (paused) { paused.notifyAll(); } stateMessage = "Resumed"; publishState(); }
     public boolean paused() { return paused.get(); }
-    public void clearScanState() {
-        cancelQueued(); processed.clear(); rootCounts.clear(); repository.clearResults();
+
+    public void clearScanState() { beginNewGeneration(true, "Results cleared"); }
+
+    public void cancelQueued() { beginNewGeneration(false, "Queued work cancelled"); }
+
+    public void reconfigure() {
+        hostLimits.clear(); observedCache.clear(); rootAnnotations.clear();
+        stateMessage = "Settings applied";
+        publishState();
     }
-    public void cancelQueued() {
-        epoch.incrementAndGet();
-        workers.getQueue().clear(); scheduler.getQueue().clear(); scheduled.clear();
-        api.logging().logToOutput("JS Secret Hunter: queued work cancelled; in-flight HTTP requests may still finish.");
+
+    private long beginNewGeneration(boolean clearResults, String message) {
+        stateMessage = message;
+        long generation = epoch.incrementAndGet();
+        repository.activeGeneration(generation);
+        workers.getQueue().clear(); scheduler.getQueue().clear();
+        scheduled.clear(); discoveredPerRoot.clear(); processed.clear(); rootCounts.clear();
+        if (clearResults) rootAnnotations.clear();
+        repository.cancelActiveAssets(message);
+        if (clearResults) { repository.clearResults(); scanned.set(0); }
+        api.logging().logToOutput("JS Secret Hunter: " + message + "; in-flight HTTP requests will be ignored when they finish.");
+        publishState();
+        return generation;
     }
 
     public void shutdown() {
-        stopping.set(true); resume(); coordinator.shutdownNow(); scheduler.shutdownNow(); workers.shutdownNow();
+        stopping.set(true); long generation = epoch.incrementAndGet(); repository.activeGeneration(generation); resume();
+        coordinator.shutdownNow(); scheduler.shutdownNow(); workers.shutdownNow();
+        stateMessage = "Stopped"; publishState();
     }
 
-    private void waitIfPaused() {
+    private boolean waitIfPaused(long generation) {
         synchronized (paused) {
-            while (paused.get() && !stopping.get()) {
-                try { paused.wait(500); } catch (InterruptedException error) { Thread.currentThread().interrupt(); return; }
+            while (paused.get() && !stopping.get() && generation == epoch.get()) {
+                try { paused.wait(250); }
+                catch (InterruptedException error) { Thread.currentThread().interrupt(); return false; }
             }
         }
+        return !stopping.get() && generation == epoch.get();
+    }
+
+    private void publishState() {
+        stateVersion.incrementAndGet();
+        scheduleStateNotification();
+    }
+
+    private void scheduleStateNotification() {
+        if (!stateNotificationPending.compareAndSet(false, true)) return;
+        SwingUtilities.invokeLater(() -> {
+            Timer timer = new Timer(50, ignored -> deliverStateNotification());
+            timer.setRepeats(false); timer.start();
+        });
+    }
+
+    private void deliverStateNotification() {
+        long delivered = stateVersion.get();
+        try { stateListener.accept(currentState()); }
+        catch (RuntimeException error) { api.logging().logToError("JS Secret Hunter state listener failed", error); }
+        finally {
+            stateNotificationPending.set(false);
+            if (stateVersion.get() != delivered) scheduleStateNotification();
+        }
+    }
+
+    private ScanState currentState() {
+        ScanState.Phase phase;
+        if (stopping.get()) phase = ScanState.Phase.STOPPED;
+        else if (paused.get()) phase = ScanState.Phase.PAUSED;
+        else if (historyScanning.get() || inFlight.get() > 0 || !workers.getQueue().isEmpty() || !scheduler.getQueue().isEmpty()) phase = ScanState.Phase.SCANNING;
+        else phase = ScanState.Phase.IDLE;
+        int queued = workers.getQueue().size() + scheduler.getQueue().size();
+        return new ScanState(phase, queued, inFlight.get(), scanned.get(), repository.findingCount(), stateMessage);
     }
 
     private static AssetRecord asset(Work w, AssetRecord.AssetStatus status, String detail) {
         return new AssetRecord(w.url, w.parentUrl, w.rootUrl, w.depth, w.chain, status, detail, w.request, w.response, Instant.now());
-    }
-    private static boolean isJavaScript(HttpRequest req, HttpResponse res, String url) {
-        String mime = res.mimeType() == null ? "" : res.mimeType().toString().toLowerCase(Locale.ROOT);
-        return AssetDiscovery.isJavaScriptUrl(url) || mime.contains("script") || mime.contains("javascript");
-    }
-    private static boolean isHtml(HttpResponse res, String url) {
-        String mime = res.mimeType() == null ? "" : res.mimeType().toString().toLowerCase(Locale.ROOT);
-        String path = url.toLowerCase(Locale.ROOT).split("[?#]", 2)[0];
-        return mime.contains("html") || path.endsWith(".html") || path.endsWith(".htm");
-    }
-    private static boolean isTextual(HttpResponse res) {
-        MimeType mime = res.mimeType(); String value = mime == null ? "" : mime.toString().toLowerCase(Locale.ROOT);
-        return value.contains("text") || value.contains("json") || value.contains("xml") || value.contains("script") || value.contains("html");
     }
     private static int effectivePort(URI uri) {
         return uri.getPort() >= 0 ? uri.getPort() : ("https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80);
@@ -289,14 +429,27 @@ public final class ScannerService {
         catch (Exception invalid) { return url; }
     }
     private static String host(String url) {
-        try { return URI.create(url).getHost().toLowerCase(Locale.ROOT); } catch (RuntimeException error) { return "unknown"; }
+        try { String host = URI.create(url).getHost(); return host == null ? "unknown" : host.toLowerCase(Locale.ROOT); }
+        catch (RuntimeException error) { return "unknown"; }
     }
     private static String safeMessage(Throwable error) {
         String value = error.getMessage(); return value == null || value.isBlank() ? error.getClass().getSimpleName() : value;
     }
+    private static boolean inScope(HttpRequest request) {
+        try { return request != null && request.isInScope(); }
+        catch (RuntimeException unavailable) { return false; }
+    }
+    private static <K, V> void trimCache(Map<K, V> cache, int maximum) {
+        int limit = Math.max(100, maximum);
+        while (cache.size() > limit) {
+            var iterator = cache.keySet().iterator();
+            if (!iterator.hasNext()) return;
+            cache.remove(iterator.next());
+        }
+    }
     private static Thread daemon(Runnable r, String name) { Thread t = new Thread(r, name); t.setDaemon(true); return t; }
 
     private record Work(String url, String parentUrl, String rootUrl, int depth, List<String> chain,
-                        HttpRequest request, HttpResponse response, boolean root, long epoch) {}
+                        HttpRequest request, HttpResponse response, long epoch, boolean expand, ContentClass hint) {}
     private record Observed(HttpRequest request, HttpResponse response) {}
 }

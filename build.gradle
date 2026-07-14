@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.adminsec'
-version = '1.0.0'
+version = '1.1.0'
 
 repositories { mavenCentral() }
 
@@ -26,7 +26,10 @@ tasks.withType(JavaCompile).configureEach {
     options.release = 17
 }
 
-test { useJUnitPlatform() }
+test {
+    useJUnitPlatform()
+    systemProperty 'java.awt.headless', 'true'
+}
 
 jar {
     archiveBaseName = 'js-secret-hunter'
