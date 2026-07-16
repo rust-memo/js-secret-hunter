@@ -5,6 +5,7 @@ import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.RedirectionMode;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
@@ -13,6 +14,7 @@ import com.adminsec.jssecrethunter.model.AssetRecord;
 import com.adminsec.jssecrethunter.model.Finding;
 import com.adminsec.jssecrethunter.model.FindingKind;
 import com.adminsec.jssecrethunter.model.ReviewStatus;
+import com.adminsec.jssecrethunter.model.Severity;
 
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
@@ -30,13 +32,18 @@ import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.ListSelectionModel;
 import javax.swing.RowFilter;
 import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingWorker;
 import javax.swing.table.AbstractTableModel;
+import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.TableRowSorter;
 import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
 import java.awt.FlowLayout;
+import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.GridLayout;
@@ -50,8 +57,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
@@ -62,26 +72,41 @@ public final class HunterPanel extends JPanel {
     private final RulePackManager rules;
     private final ScannerService scanner;
     private final Consumer<LoadedRulePack> persistRules;
+    private final JTabbedPane tabs = new JTabbedPane();
+    private final HunterOverviewPanel overviewPanel;
     private final FindingModel findingModel = new FindingModel();
     private final AssetModel assetModel = new AssetModel();
     private final LinkModel linkModel = new LinkModel();
+    private final SensitiveFileModel sensitiveFileModel = new SensitiveFileModel();
     private final JTable findingTable = new JTable(findingModel);
     private final JTable assetTable = new JTable(assetModel);
     private final JTable linkTable = new JTable(linkModel);
+    private final JTable sensitiveFileTable = new JTable(sensitiveFileModel);
     private final TableRowSorter<FindingModel> sorter = new TableRowSorter<>(findingModel);
+    private final TableRowSorter<AssetModel> assetSorter = new TableRowSorter<>(assetModel);
+    private final TableRowSorter<LinkModel> linkSorter = new TableRowSorter<>(linkModel);
+    private final TableRowSorter<SensitiveFileModel> sensitiveFileSorter = new TableRowSorter<>(sensitiveFileModel);
     private final JTextField search = new JTextField(22);
+    private final JTextField linkSearch = new JTextField(28);
+    private final JTextField assetSearch = new JTextField(28);
     private final JComboBox<String> severity = new JComboBox<>(new String[]{"All severities", "CRITICAL", "HIGH", "MEDIUM", "INFO"});
     private final JComboBox<String> confidence = new JComboBox<>(new String[]{"All confidences", "HIGH", "MEDIUM", "LOW"});
-    private final JComboBox<String> kind = new JComboBox<>(new String[]{"All kinds", "SECRET", "CREDENTIAL", "ENDPOINT", "IDENTIFIER", "CONFIGURATION"});
+    private final JComboBox<String> kind = new JComboBox<>(new String[]{"All kinds", "VULNERABILITY", "SECRET", "CREDENTIAL", "ENDPOINT", "IDENTIFIER", "CONFIGURATION"});
     private final JComboBox<String> reviewStatus = new JComboBox<>(new String[]{"All statuses", "NEEDS_REVIEW", "REVIEWED", "FALSE_POSITIVE"});
+    private final JComboBox<String> linkKind = new JComboBox<>(new String[]{"All link kinds", "ENDPOINT", "CONFIGURATION"});
+    private final JComboBox<String> assetStatus = new JComboBox<>(new String[]{"All asset statuses", "QUEUED", "FETCHING", "SCANNED", "SKIPPED", "FAILED", "CANCELLED"});
     private final HttpRequestEditor requestEditor;
     private final HttpResponseEditor responseEditor;
+    private final HttpRequestEditor sensitiveRequestEditor;
+    private final HttpResponseEditor sensitiveResponseEditor;
     private final JTextArea details = new JTextArea(4, 80);
+    private final JTextArea sensitiveFileDetails = new JTextArea(7, 80);
     private final JLabel ruleInfo = new JLabel();
     private final JLabel scanInfo = new JLabel("Idle");
     private final JCheckBox autoFetch = new JCheckBox("Fetch missing assets automatically (Target Scope only)");
-    private final JCheckBox targetScopeOnly = new JCheckBox("Analyze Proxy traffic in Target Scope only");
+    private final JCheckBox scanAllHistory = new JCheckBox("Analyze all Proxy History and live responses locally (recommended)");
     private final JCheckBox annotateHistory = new JCheckBox("Write optional summaries to Proxy History notes");
+    private final JTextField assetExclusions = new JTextField(42);
     private final JSpinner maxDepth = new JSpinner(new SpinnerNumberModel(3, 0, 10, 1));
     private final JSpinner maxAssets = new JSpinner(new SpinnerNumberModel(500, 1, 10000, 10));
     private final JSpinner maxJsMb = new JSpinner(new SpinnerNumberModel(5, 1, 100, 1));
@@ -92,11 +117,13 @@ public final class HunterPanel extends JPanel {
     private final JSpinner timeout = new JSpinner(new SpinnerNumberModel(15, 3, 120, 1));
     private final JSpinner perHost = new JSpinner(new SpinnerNumberModel(2, 1, 8, 1));
     private final List<JButton> selectionActions = new ArrayList<>();
+    private final List<JButton> sensitiveFileActions = new ArrayList<>();
     private JButton pauseButton;
     private JButton cancelButton;
     private JButton publishButton;
     private JButton copyLinkButton;
     private JButton repeatLinkButton;
+    private JButton repeatDetectedLinkButton;
     private volatile ScanState lastScanState = new ScanState(ScanState.Phase.IDLE, 0, 0, 0, 0, "Idle");
     private volatile int droppedFindings;
 
@@ -105,21 +132,30 @@ public final class HunterPanel extends JPanel {
         super(new BorderLayout());
         this.api = api; this.config = config; this.repository = repository; this.rules = rules;
         this.scanner = scanner; this.persistRules = persistRules;
+        overviewPanel = new HunterOverviewPanel(this::rescan, this::togglePause, scanner::cancelQueued,
+                this::confirmClear, this::showVulnerabilities, this::openFinding);
         requestEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
         responseEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
-        build(); loadSettings(); updateRuleInfo(); updateSelectionActions();
+        sensitiveRequestEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
+        sensitiveResponseEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
+        build(); loadSettings(); updateRuleInfo(); updateSelectionActions(); updateSensitiveFileActions();
         repository.listener(snapshot -> {
-            findingModel.replace(snapshot.findings()); linkModel.replace(snapshot.findings()); assetModel.replace(snapshot.assets());
-            droppedFindings = snapshot.droppedFindings(); applyFilter(); updateSelectionActions(); updateScanInfo();
+            findingModel.replace(snapshot.findings()); linkModel.replace(snapshot.findings());
+            sensitiveFileModel.replace(snapshot.findings()); assetModel.replace(snapshot.assets());
+            droppedFindings = snapshot.droppedFindings(); applyFilter(); updateSelectionActions();
+            showSensitiveFile(); updateSensitiveFileActions(); overviewPanel.updateSnapshot(snapshot); updateScanInfo();
         });
-        scanner.stateListener(state -> { lastScanState = state; updateScanInfo(); updateScannerButtons(); });
+        scanner.stateListener(state -> { lastScanState = state; updateScanInfo(); updateScannerButtons();
+            overviewPanel.updateState(state, droppedFindings); });
         HunterRepository.Snapshot snapshot = repository.snapshot();
-        findingModel.replace(snapshot.findings()); linkModel.replace(snapshot.findings()); assetModel.replace(snapshot.assets()); droppedFindings = snapshot.droppedFindings();
+        findingModel.replace(snapshot.findings()); linkModel.replace(snapshot.findings());
+        sensitiveFileModel.replace(snapshot.findings()); assetModel.replace(snapshot.assets()); droppedFindings = snapshot.droppedFindings();
+        overviewPanel.updateSnapshot(snapshot); overviewPanel.updateState(lastScanState, droppedFindings);
     }
 
     private void build() {
-        JTabbedPane tabs = new JTabbedPane();
-        tabs.addTab("Findings", findingsTab()); tabs.addTab("Links", linksTab()); tabs.addTab("Assets", assetsTab());
+        tabs.addTab("Overview", overviewPanel); tabs.addTab("Findings", findingsTab()); tabs.addTab("Sensitive Files", sensitiveFilesTab());
+        tabs.addTab("Links", linksTab()); tabs.addTab("Assets", assetsTab());
         tabs.addTab("Rules", rulesTab()); tabs.addTab("Settings", settingsTab());
         add(tabs, BorderLayout.CENTER); api.userInterface().applyThemeToComponent(this);
     }
@@ -131,17 +167,17 @@ public final class HunterPanel extends JPanel {
         filters.add(new JLabel("Search:")); filters.add(search); filters.add(severity); filters.add(confidence); filters.add(kind); filters.add(reviewStatus);
         JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT));
         addButton(controls, "Rescan History", this::rescan);
-        pauseButton = addButton(controls, "Pause", () -> { if (scanner.paused()) scanner.resume(); else scanner.pause(); });
+        pauseButton = addButton(controls, "Pause", this::togglePause);
         cancelButton = addButton(controls, "Cancel queued", scanner::cancelQueued);
-        addButton(controls, "Clear", scanner::clearScanState);
+        addButton(controls, "Clear", this::confirmClear);
         top.add(filters); top.add(controls);
         search.getDocument().addDocumentListener((DocumentChange) e -> applyFilter());
         severity.addActionListener(e -> applyFilter()); confidence.addActionListener(e -> applyFilter());
         kind.addActionListener(e -> applyFilter()); reviewStatus.addActionListener(e -> applyFilter());
 
-        findingTable.setRowSorter(sorter); findingTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
         int[] widths = {70, 85, 105, 210, 170, 55, 480, 110, 75};
-        for (int i = 0; i < widths.length; i++) findingTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
+        configureTable(findingTable, sorter, widths);
+        sorter.setComparator(0, severityComparator());
         findingTable.getSelectionModel().addListSelectionListener(e -> { showFinding(); updateSelectionActions(); });
         details.setEditable(false); details.setLineWrap(true); details.setWrapStyleWord(true);
         JTabbedPane lower = new JTabbedPane();
@@ -172,23 +208,67 @@ public final class HunterPanel extends JPanel {
     }
 
     private JPanel assetsTab() {
-        JPanel panel = new JPanel(new BorderLayout()); assetTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+        JPanel panel = new JPanel(new BorderLayout());
         int[] widths = {95, 55, 470, 400, 160};
-        for (int i = 0; i < widths.length; i++) assetTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
-        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        top.add(new JLabel("Background assets are fetched only when every URL is in Target Scope."));
+        configureTable(assetTable, assetSorter, widths);
+        JPanel top = new JPanel(); top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
+        JPanel intro = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        intro.add(new JLabel("Discovered assets and fetch decisions. Background requests are always limited to Target Scope."));
+        JPanel filters = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        filters.add(new JLabel("Search:")); filters.add(assetSearch); filters.add(assetStatus);
+        top.add(intro); top.add(filters);
+        assetSearch.getDocument().addDocumentListener((DocumentChange) ignored -> applyAssetFilter());
+        assetStatus.addActionListener(ignored -> applyAssetFilter());
         panel.add(top, BorderLayout.NORTH); panel.add(new JScrollPane(assetTable), BorderLayout.CENTER); return panel;
     }
 
-    private JPanel linksTab() {
-        JPanel panel = new JPanel(new BorderLayout()); linkTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
-        int[] widths = {75, 90, 115, 220, 360, 460, 55, 110};
-        for (int i = 0; i < widths.length; i++) linkTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
-        linkTable.getSelectionModel().addListSelectionListener(ignored -> updateLinkActions());
+    private JPanel sensitiveFilesTab() {
+        JPanel panel = new JPanel(new BorderLayout());
+        int[] widths = {80, 75, 95, 80, 105, 500, 380};
+        configureTable(sensitiveFileTable, sensitiveFileSorter, widths);
+        sensitiveFileSorter.setComparator(0, severityComparator());
+        sensitiveFileTable.getSelectionModel().addListSelectionListener(ignored -> {
+            showSensitiveFile(); updateSensitiveFileActions();
+        });
+
         JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        top.add(new JLabel("Detected API, admin, GraphQL, WebSocket, storage, and configuration links are listed here."));
+        top.add(new JLabel("One row per Proxy History file containing candidates. Select a file to inspect its stored Request/Response."));
+
+        sensitiveFileDetails.setEditable(false); sensitiveFileDetails.setLineWrap(true); sensitiveFileDetails.setWrapStyleWord(true);
+        JTabbedPane lower = new JTabbedPane();
+        lower.addTab("Request", sensitiveRequestEditor.uiComponent());
+        lower.addTab("Response", sensitiveResponseEditor.uiComponent());
+        lower.addTab("File findings", new JScrollPane(sensitiveFileDetails));
+        JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(sensitiveFileTable), lower);
+        split.setResizeWeight(.45);
+
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        copyLinkButton = addButton(actions, "Copy link", this::copyDetectedLink);
+        addSensitiveFileButton(actions, "Copy redacted file URL", this::copySensitiveFileUrl);
+        addSensitiveFileButton(actions, "Send file to Repeater", this::sendSensitiveFileToRepeater);
+        addSensitiveFileButton(actions, "Mark file reviewed", () -> sensitiveFileStatus(ReviewStatus.REVIEWED));
+        addSensitiveFileButton(actions, "Mark file false positive", () -> sensitiveFileStatus(ReviewStatus.FALSE_POSITIVE));
+        addSensitiveFileButton(actions, "Reset file to needs review", () -> sensitiveFileStatus(ReviewStatus.NEEDS_REVIEW));
+        panel.add(top, BorderLayout.NORTH); panel.add(split, BorderLayout.CENTER); panel.add(actions, BorderLayout.SOUTH);
+        return panel;
+    }
+
+    private JPanel linksTab() {
+        JPanel panel = new JPanel(new BorderLayout());
+        int[] widths = {75, 90, 115, 220, 320, 430, 430, 55, 110};
+        configureTable(linkTable, linkSorter, widths);
+        linkSorter.setComparator(0, severityComparator());
+        linkTable.getSelectionModel().addListSelectionListener(ignored -> updateLinkActions());
+        JPanel top = new JPanel(); top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
+        JPanel intro = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        intro.add(new JLabel("Application endpoints, APIs, admin routes, WebSockets, storage, and configuration links."));
+        JPanel filters = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        filters.add(new JLabel("Search:")); filters.add(linkSearch); filters.add(linkKind);
+        top.add(intro); top.add(filters);
+        linkSearch.getDocument().addDocumentListener((DocumentChange) ignored -> applyLinkFilter());
+        linkKind.addActionListener(ignored -> applyLinkFilter());
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        copyLinkButton = addButton(actions, "Copy redacted URL", this::copyDetectedLink);
+        repeatDetectedLinkButton = addButton(actions, "Send endpoint to Repeater", this::sendDetectedLinkToRepeater);
         repeatLinkButton = addButton(actions, "Send source to Repeater", this::sendLinkSourceToRepeater);
         updateLinkActions();
         panel.add(top, BorderLayout.NORTH); panel.add(new JScrollPane(linkTable), BorderLayout.CENTER); panel.add(actions, BorderLayout.SOUTH);
@@ -217,8 +297,10 @@ public final class HunterPanel extends JPanel {
     private JPanel settingsTab() {
         JPanel panel = new JPanel(new GridBagLayout()); panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
         GridBagConstraints c = new GridBagConstraints(); c.insets = new Insets(6, 6, 6, 6); c.anchor = GridBagConstraints.WEST;
-        c.gridx = 0; c.gridy = 0; c.gridwidth = 2; panel.add(targetScopeOnly, c); c.gridy++; panel.add(autoFetch, c);
+        c.gridx = 0; c.gridy = 0; c.gridwidth = 2; panel.add(scanAllHistory, c); c.gridy++; panel.add(autoFetch, c);
         c.gridy++; panel.add(annotateHistory, c); c.gridwidth = 1;
+        assetExclusions.setToolTipText("Comma-separated URL fragments. Matching assets already present in History are still analyzed locally.");
+        addSetting(panel, c, "Background asset exclusions:", assetExclusions);
         addSetting(panel, c, "Maximum discovery depth:", maxDepth);
         addSetting(panel, c, "Maximum assets per root:", maxAssets);
         addSetting(panel, c, "Maximum JavaScript size (MB):", maxJsMb);
@@ -230,17 +312,18 @@ public final class HunterPanel extends JPanel {
         addSetting(panel, c, "Concurrent requests per host:", perHost);
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT)); addButton(actions, "Apply and rescan", this::applySettings);
         c.gridx = 0; c.gridy++; c.gridwidth = 2; panel.add(actions, c);
-        c.gridy++; panel.add(new JLabel("Manual out-of-scope scans are local-only. Automatic fetching always enforces Target Scope."), c);
+        c.gridy++; panel.add(new JLabel("History/live analysis uses stored responses only. Automatic fetching always enforces Target Scope."), c);
         c.weighty = 1; c.gridy++; panel.add(new JPanel(), c); return panel;
     }
 
-    private void addSetting(JPanel panel, GridBagConstraints c, String label, JSpinner spinner) {
-        c.gridy++; c.gridx = 0; panel.add(new JLabel(label), c); c.gridx = 1; panel.add(spinner, c);
+    private void addSetting(JPanel panel, GridBagConstraints c, String label, java.awt.Component editor) {
+        c.gridy++; c.gridx = 0; panel.add(new JLabel(label), c); c.gridx = 1; panel.add(editor, c);
     }
 
     private void loadSettings() {
-        targetScopeOnly.setSelected(config.scanScope() == ScanScope.TARGET_SCOPE); autoFetch.setSelected(config.autoFetch());
+        scanAllHistory.setSelected(config.scanScope() == ScanScope.ALL_TRAFFIC); autoFetch.setSelected(config.autoFetch());
         annotateHistory.setSelected(config.annotateHistory());
+        assetExclusions.setText(config.assetExclusions());
         maxDepth.setValue(config.maxDepth()); maxAssets.setValue(config.maxAssetsPerRoot());
         maxJsMb.setValue(config.maxJsBytes() / 1024 / 1024); maxMapMb.setValue(config.maxMapBytes() / 1024 / 1024);
         maxTextMb.setValue(config.maxTextBytes() / 1024 / 1024); maxHistoryEntries.setValue(config.maxHistoryEntries());
@@ -248,8 +331,9 @@ public final class HunterPanel extends JPanel {
     }
 
     private void applySettings() {
-        config.scanScope(targetScopeOnly.isSelected() ? ScanScope.TARGET_SCOPE : ScanScope.ALL_TRAFFIC);
-        config.autoFetch(autoFetch.isSelected()); config.annotateHistory(annotateHistory.isSelected()); config.maxDepth((Integer) maxDepth.getValue());
+        config.scanScope(scanAllHistory.isSelected() ? ScanScope.ALL_TRAFFIC : ScanScope.TARGET_SCOPE);
+        config.autoFetch(autoFetch.isSelected()); config.annotateHistory(annotateHistory.isSelected());
+        config.assetExclusions(assetExclusions.getText()); config.maxDepth((Integer) maxDepth.getValue());
         config.maxAssetsPerRoot((Integer) maxAssets.getValue()); config.maxJsBytes((Integer) maxJsMb.getValue() * 1024 * 1024);
         config.maxMapBytes((Integer) maxMapMb.getValue() * 1024 * 1024); config.maxTextBytes((Integer) maxTextMb.getValue() * 1024 * 1024);
         config.maxHistoryEntries((Integer) maxHistoryEntries.getValue()); config.maxFindings((Integer) maxFindings.getValue());
@@ -260,11 +344,15 @@ public final class HunterPanel extends JPanel {
     private void showFinding() {
         Finding f = selected();
         if (f == null) { details.setText(""); return; }
-        requestEditor.setRequest(f.request()); if (f.response() != null) responseEditor.setResponse(f.response());
+        requestEditor.setRequest(f.request());
+        responseEditor.setResponse(f.response() == null ? HttpResponse.httpResponse() : f.response());
         if (!f.rawValue().isBlank()) responseEditor.setSearchExpression(f.rawValue());
         details.setText("Rule: " + f.ruleName() + " (" + f.ruleId() + ")\nValue: " + f.maskedValue()
                 + "\nSHA-256: " + f.valueFingerprint() + "\nLine: " + f.line() + "\nChain: "
-                + String.join(" -> ", f.discoveryChain()) + "\nEvidence: " + f.preview());
+                + f.discoveryChain().stream().map(Finding::redactUrlValue).collect(java.util.stream.Collectors.joining(" -> "))
+                + (f.description().isBlank() ? "" : "\n\nWhy it matters: " + f.description())
+                + (f.remediation().isBlank() ? "" : "\nRemediation: " + f.remediation())
+                + "\n\nEvidence: " + f.preview());
     }
 
     private Finding selected() {
@@ -296,6 +384,54 @@ public final class HunterPanel extends JPanel {
 
     private void sendToRepeater() { Finding f = selected(); if (f != null) api.repeater().sendToRepeater(f.request(), "JS asset - " + host(f.assetUrl())); }
     private void status(ReviewStatus status) { Finding f = selected(); if (f != null) repository.setStatus(f, status); }
+
+    private SensitiveFileRow selectedSensitiveFile() {
+        int row = sensitiveFileTable.getSelectedRow();
+        return row < 0 ? null : sensitiveFileModel.get(sensitiveFileTable.convertRowIndexToModel(row));
+    }
+
+    private void showSensitiveFile() {
+        SensitiveFileRow row = selectedSensitiveFile();
+        if (row == null) { sensitiveFileDetails.setText(""); return; }
+        Finding source = row.source();
+        sensitiveRequestEditor.setRequest(source.request());
+        sensitiveResponseEditor.setResponse(source.response() == null ? HttpResponse.httpResponse() : source.response());
+        Finding focus = row.findings().stream().filter(f -> f.reviewStatus() == ReviewStatus.NEEDS_REVIEW).findFirst().orElse(source);
+        if (!focus.rawValue().isBlank()) sensitiveResponseEditor.setSearchExpression(focus.rawValue());
+        StringBuilder text = new StringBuilder("File: ").append(Finding.redactUrlValue(row.assetUrl()))
+                .append("\nHighest severity: ").append(row.severity())
+                .append("\nCandidates: ").append(row.findings().size()).append("\n\n");
+        for (Finding finding : row.findings()) {
+            text.append('[').append(finding.reviewStatus()).append("] ")
+                    .append(finding.severity()).append(" | ").append(finding.ruleName())
+                    .append(" | line ").append(finding.line()).append(" | ").append(finding.maskedValue())
+                    .append("\n  ").append(finding.preview()).append('\n');
+        }
+        sensitiveFileDetails.setText(text.toString());
+        sensitiveFileDetails.setCaretPosition(0);
+    }
+
+    private void updateSensitiveFileActions() {
+        boolean selected = selectedSensitiveFile() != null;
+        for (JButton button : sensitiveFileActions) button.setEnabled(selected);
+    }
+
+    private void sensitiveFileStatus(ReviewStatus status) {
+        SensitiveFileRow row = selectedSensitiveFile();
+        if (row != null) repository.setStatus(row.findings(), status);
+    }
+
+    private void copySensitiveFileUrl() {
+        SensitiveFileRow row = selectedSensitiveFile(); if (row == null) return;
+        try { Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
+                new StringSelection(Finding.redactUrlValue(row.assetUrl())), null); }
+        catch (RuntimeException error) { showError("Copy failed", error); }
+    }
+
+    private void sendSensitiveFileToRepeater() {
+        SensitiveFileRow row = selectedSensitiveFile();
+        if (row != null) api.repeater().sendToRepeater(row.source().request(), "Sensitive file - " + host(row.assetUrl()));
+    }
 
     private void ignoreRule() {
         Finding f = selected(); if (f == null) return;
@@ -342,6 +478,34 @@ public final class HunterPanel extends JPanel {
         updateScanInfo();
     }
 
+    private void applyLinkFilter() {
+        String query = linkSearch.getText().trim().toLowerCase(Locale.ROOT);
+        String selectedKind = (String) linkKind.getSelectedItem();
+        linkSorter.setRowFilter(new RowFilter<>() {
+            @Override public boolean include(Entry<? extends LinkModel, ? extends Integer> entry) {
+                Finding finding = linkModel.get(entry.getIdentifier());
+                boolean kindMatches = "All link kinds".equals(selectedKind) || finding.kind().name().equals(selectedKind);
+                String haystack = (finding.ruleName() + " " + finding.rawValue() + " " + resolveDetectedLink(finding)
+                        + " " + finding.assetUrl() + " " + host(finding.assetUrl())).toLowerCase(Locale.ROOT);
+                return kindMatches && (query.isBlank() || haystack.contains(query));
+            }
+        });
+    }
+
+    private void applyAssetFilter() {
+        String query = assetSearch.getText().trim().toLowerCase(Locale.ROOT);
+        String selectedStatus = (String) assetStatus.getSelectedItem();
+        assetSorter.setRowFilter(new RowFilter<>() {
+            @Override public boolean include(Entry<? extends AssetModel, ? extends Integer> entry) {
+                AssetRecord asset = assetModel.get(entry.getIdentifier());
+                boolean statusMatches = "All asset statuses".equals(selectedStatus) || asset.status().name().equals(selectedStatus);
+                String haystack = (asset.url() + " " + asset.parentUrl() + " " + asset.rootUrl() + " " + asset.detail())
+                        .toLowerCase(Locale.ROOT);
+                return statusMatches && (query.isBlank() || haystack.contains(query));
+            }
+        });
+    }
+
     private void export(boolean csv, boolean full) {
         if (full) {
             int answer = JOptionPane.showConfirmDialog(api.userInterface().swingUtils().suiteFrame(),
@@ -383,20 +547,46 @@ public final class HunterPanel extends JPanel {
     }
 
     private void updateLinkActions() {
-        boolean selected = selectedLink() != null;
+        Finding finding = selectedLink();
+        boolean selected = finding != null;
         if (copyLinkButton != null) copyLinkButton.setEnabled(selected);
         if (repeatLinkButton != null) repeatLinkButton.setEnabled(selected);
+        if (repeatDetectedLinkButton != null) {
+            String resolved = finding == null ? "" : resolveDetectedLink(finding).toLowerCase(Locale.ROOT);
+            repeatDetectedLinkButton.setEnabled(resolved.startsWith("http://") || resolved.startsWith("https://"));
+        }
     }
 
     private void copyDetectedLink() {
         Finding finding = selectedLink(); if (finding == null) return;
-        try { Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(finding.rawValue()), null); }
+        String presentation = Finding.redactUrlValue(resolveDetectedLink(finding));
+        try { Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(presentation), null); }
         catch (RuntimeException error) { showError("Copy failed", error); }
+    }
+
+    private void sendDetectedLinkToRepeater() {
+        Finding finding = selectedLink(); if (finding == null) return;
+        String target = resolveDetectedLink(finding);
+        if (!target.toLowerCase(Locale.ROOT).matches("^https?://.*")) return;
+        try {
+            HttpRequest request = ScannerService.requestFor(target, finding.request());
+            api.repeater().sendToRepeater(request, "Detected endpoint - " + host(target));
+        } catch (RuntimeException error) { showError("Could not create endpoint request", error); }
     }
 
     private void sendLinkSourceToRepeater() {
         Finding finding = selectedLink();
         if (finding != null) api.repeater().sendToRepeater(finding.request(), "Link source - " + host(finding.assetUrl()));
+    }
+
+    static String resolveDetectedLink(Finding finding) {
+        if (finding == null || finding.rawValue().isBlank()) return "";
+        if (finding.kind() == FindingKind.ENDPOINT) return HunterExporter.resolvedUrl(finding);
+        String raw = finding.rawValue().trim();
+        String lower = raw.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("ws://") || lower.startsWith("wss://")) return raw;
+        String resolved = AssetDiscovery.resolve(finding.assetUrl(), raw);
+        return resolved == null ? raw : resolved;
     }
 
     private void importRulesFile() {
@@ -441,6 +631,35 @@ public final class HunterPanel extends JPanel {
     }
 
     private void rescan() { scanner.restartHistoryScan(); }
+    private void togglePause() { if (scanner.paused()) scanner.resume(); else scanner.pause(); }
+    private void confirmClear() {
+        int answer = JOptionPane.showConfirmDialog(api.userInterface().swingUtils().suiteFrame(),
+                "Clear the current findings and asset inventory? Saved review decisions will be retained.",
+                "Clear JS Secret Hunter results", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (answer == JOptionPane.OK_OPTION) scanner.clearScanState();
+    }
+
+    private void openFinding(Finding target) {
+        if (target == null) return;
+        for (int modelRow = 0; modelRow < findingModel.getRowCount(); modelRow++) {
+            if (!findingModel.get(modelRow).fingerprint().equals(target.fingerprint())) continue;
+            search.setText(""); severity.setSelectedIndex(0); confidence.setSelectedIndex(0);
+            kind.setSelectedIndex(0); reviewStatus.setSelectedIndex(0); applyFilter();
+            int viewRow = findingTable.convertRowIndexToView(modelRow);
+            if (viewRow >= 0) {
+                findingTable.setRowSelectionInterval(viewRow, viewRow);
+                findingTable.scrollRectToVisible(findingTable.getCellRect(viewRow, 0, true));
+                tabs.setSelectedIndex(1);
+            }
+            return;
+        }
+    }
+
+    private void showVulnerabilities() {
+        search.setText(""); severity.setSelectedIndex(0); confidence.setSelectedIndex(0);
+        reviewStatus.setSelectedIndex(0); kind.setSelectedItem("VULNERABILITY"); applyFilter();
+        tabs.setSelectedIndex(1);
+    }
     private void updateRuleInfo() {
         LoadedRulePack p = rules.current(); ruleInfo.setText("Active pack: " + p.version() + " | " + p.rules().size() + " rules | SHA-256 " + p.shortHash() + "…");
     }
@@ -448,8 +667,9 @@ public final class HunterPanel extends JPanel {
         ScanState s = lastScanState;
         String dropped = droppedFindings > 0 ? " | capped: " + droppedFindings : "";
         scanInfo.setText(s.phase() + " | queued: " + s.queued() + " | active: " + s.inFlight() + " | scanned: " + s.scanned()
-                + " | findings: " + s.findings() + " | links: " + linkModel.getRowCount()
+                + " | findings: " + s.findings() + " | files: " + sensitiveFileModel.getRowCount() + " | links: " + linkModel.getRowCount()
                 + " | visible: " + findingTable.getRowCount() + dropped + " | " + s.message());
+        overviewPanel.updateState(s, droppedFindings);
     }
     private void updateScannerButtons() {
         if (pauseButton != null) pauseButton.setText(lastScanState.phase() == ScanState.Phase.PAUSED ? "Resume" : "Pause");
@@ -457,6 +677,7 @@ public final class HunterPanel extends JPanel {
                 || lastScanState.phase() == ScanState.Phase.SCANNING || lastScanState.phase() == ScanState.Phase.PAUSED);
     }
     int linkCount() { return linkModel.getRowCount(); }
+    int sensitiveFileCount() { return sensitiveFileModel.getRowCount(); }
     private void showError(String title, Throwable error) {
         String message = error == null || error.getMessage() == null || error.getMessage().isBlank()
                 ? (error == null ? "Unknown error" : error.getClass().getSimpleName()) : error.getMessage();
@@ -466,11 +687,47 @@ public final class HunterPanel extends JPanel {
         try { String host = java.net.URI.create(url).getHost(); return host == null ? "asset" : host; }
         catch (RuntimeException error) { return "asset"; }
     }
+    private static <M extends AbstractTableModel> void configureTable(JTable table, TableRowSorter<M> rowSorter, int[] widths) {
+        table.setRowSorter(rowSorter);
+        table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+        table.setFillsViewportHeight(true);
+        table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        table.setRowHeight(Math.max(22, table.getRowHeight()));
+        table.setDefaultRenderer(Severity.class, new SeverityRenderer());
+        for (int index = 0; index < widths.length; index++) {
+            table.getColumnModel().getColumn(index).setPreferredWidth(widths[index]);
+        }
+    }
+    private static Comparator<Object> severityComparator() {
+        return Comparator.comparingInt(value -> value instanceof Severity severity ? severity.rank() : Integer.MAX_VALUE);
+    }
+    private static final class SeverityRenderer extends DefaultTableCellRenderer {
+        @Override public Component getTableCellRendererComponent(JTable table, Object value, boolean selected,
+                                                                  boolean focused, int row, int column) {
+            Component component = super.getTableCellRendererComponent(table, value, selected, focused, row, column);
+            component.setFont(component.getFont().deriveFont(value instanceof Severity ? Font.BOLD : Font.PLAIN));
+            if (!selected && value instanceof Severity severity) {
+                Color background = table.getBackground();
+                boolean dark = background.getRed() + background.getGreen() + background.getBlue() < 384;
+                component.setForeground(switch (severity) {
+                    case CRITICAL -> dark ? new Color(255, 120, 120) : new Color(183, 28, 28);
+                    case HIGH -> dark ? new Color(255, 183, 77) : new Color(230, 81, 0);
+                    case MEDIUM -> dark ? new Color(255, 213, 79) : new Color(130, 92, 0);
+                    case INFO -> table.getForeground();
+                });
+            }
+            return component;
+        }
+    }
     private static JButton addButton(JPanel panel, String label, Runnable action) {
         JButton button = new JButton(label); button.addActionListener(e -> action.run()); panel.add(button); return button;
     }
     private JButton addSelectionButton(JPanel panel, String label, Runnable action, String tooltip) {
         JButton button = addButton(panel, label, action); button.setToolTipText(tooltip); selectionActions.add(button); return button;
+    }
+
+    private JButton addSensitiveFileButton(JPanel panel, String label, Runnable action) {
+        JButton button = addButton(panel, label, action); sensitiveFileActions.add(button); return button;
     }
 
     private static final class FindingModel extends AbstractTableModel {
@@ -480,23 +737,32 @@ public final class HunterPanel extends JPanel {
         Finding get(int row) { return rows.get(row); }
         public int getRowCount() { return rows.size(); } public int getColumnCount() { return columns.length; }
         public String getColumnName(int column) { return columns[column]; }
+        public Class<?> getColumnClass(int column) { return switch (column) {
+            case 0 -> Severity.class; case 1 -> com.adminsec.jssecrethunter.model.Confidence.class;
+            case 2 -> FindingKind.class; case 5 -> Integer.class; case 7 -> ReviewStatus.class; default -> String.class;
+        }; }
         public Object getValueAt(int row, int column) { Finding f = rows.get(row); return switch (column) {
             case 0 -> f.severity(); case 1 -> f.confidence(); case 2 -> f.kind(); case 3 -> f.ruleName();
-            case 4 -> f.maskedValue(); case 5 -> f.line(); case 6 -> f.assetUrl(); case 7 -> f.reviewStatus(); default -> f.published() ? "Yes" : ""; }; }
+            case 4 -> f.maskedValue(); case 5 -> f.line(); case 6 -> Finding.redactUrlValue(f.assetUrl());
+            case 7 -> f.reviewStatus(); default -> f.published() ? "Yes" : ""; }; }
     }
 
     private static final class AssetModel extends AbstractTableModel {
         private final String[] columns = {"Status", "Depth", "URL", "Parent", "Detail"};
         private List<AssetRecord> rows = new ArrayList<>();
         void replace(List<AssetRecord> values) { rows = new ArrayList<>(values); fireTableDataChanged(); }
+        AssetRecord get(int row) { return rows.get(row); }
         public int getRowCount() { return rows.size(); } public int getColumnCount() { return columns.length; }
         public String getColumnName(int column) { return columns[column]; }
+        public Class<?> getColumnClass(int column) { return column == 1 ? Integer.class
+                : column == 0 ? AssetRecord.AssetStatus.class : String.class; }
         public Object getValueAt(int row, int column) { AssetRecord a = rows.get(row); return switch (column) {
-            case 0 -> a.status(); case 1 -> a.depth(); case 2 -> a.url(); case 3 -> a.parentUrl(); default -> a.detail(); }; }
+            case 0 -> a.status(); case 1 -> a.depth(); case 2 -> Finding.redactUrlValue(a.url());
+            case 3 -> Finding.redactUrlValue(a.parentUrl()); default -> a.detail(); }; }
     }
 
     private static final class LinkModel extends AbstractTableModel {
-        private final String[] columns = {"Severity", "Confidence", "Kind", "Rule", "Detected link", "Source asset", "Line", "Status"};
+        private final String[] columns = {"Severity", "Confidence", "Kind", "Rule", "Detected link", "Resolved URL", "Source asset", "Line", "Status"};
         private List<Finding> rows = new ArrayList<>();
         void replace(List<Finding> values) {
             rows = values.stream().filter(finding -> finding.kind() == FindingKind.ENDPOINT
@@ -506,9 +772,71 @@ public final class HunterPanel extends JPanel {
         Finding get(int row) { return rows.get(row); }
         public int getRowCount() { return rows.size(); } public int getColumnCount() { return columns.length; }
         public String getColumnName(int column) { return columns[column]; }
+        public Class<?> getColumnClass(int column) { return switch (column) {
+            case 0 -> Severity.class; case 1 -> com.adminsec.jssecrethunter.model.Confidence.class;
+            case 2 -> FindingKind.class; case 7 -> Integer.class; case 8 -> ReviewStatus.class; default -> String.class;
+        }; }
         public Object getValueAt(int row, int column) { Finding f = rows.get(row); return switch (column) {
             case 0 -> f.severity(); case 1 -> f.confidence(); case 2 -> f.kind(); case 3 -> f.ruleName();
-            case 4 -> f.rawValue(); case 5 -> f.assetUrl(); case 6 -> f.line(); default -> f.reviewStatus(); }; }
+            case 4 -> f.maskedValue(); case 5 -> Finding.redactUrlValue(resolveDetectedLink(f));
+            case 6 -> Finding.redactUrlValue(f.assetUrl()); case 7 -> f.line(); default -> f.reviewStatus(); }; }
+    }
+
+    private static final class SensitiveFileModel extends AbstractTableModel {
+        private final String[] columns = {"Severity", "Findings", "Needs review", "Reviewed", "False positive", "File URL", "Rules"};
+        private List<SensitiveFileRow> rows = new ArrayList<>();
+
+        void replace(List<Finding> values) {
+            Map<String, List<Finding>> grouped = new LinkedHashMap<>();
+            for (Finding finding : values) {
+                if (finding.kind() == FindingKind.ENDPOINT) continue;
+                grouped.computeIfAbsent(finding.assetUrl(), ignored -> new ArrayList<>()).add(finding);
+            }
+            List<SensitiveFileRow> next = new ArrayList<>();
+            for (Map.Entry<String, List<Finding>> entry : grouped.entrySet()) {
+                Severity highest = Severity.INFO;
+                List<String> ruleNames = new ArrayList<>();
+                for (Finding finding : entry.getValue()) {
+                    if (finding.severity().rank() < highest.rank()) highest = finding.severity();
+                    if (!ruleNames.contains(finding.ruleName())) ruleNames.add(finding.ruleName());
+                }
+                next.add(new SensitiveFileRow(entry.getKey(), highest, List.copyOf(entry.getValue()), String.join(", ", ruleNames)));
+            }
+            rows = next; fireTableDataChanged();
+        }
+
+        SensitiveFileRow get(int row) { return rows.get(row); }
+        public int getRowCount() { return rows.size(); }
+        public int getColumnCount() { return columns.length; }
+        public String getColumnName(int column) { return columns[column]; }
+        public Class<?> getColumnClass(int column) { return switch (column) {
+            case 0 -> Severity.class; case 1, 2, 3, 4 -> Integer.class; default -> String.class;
+        }; }
+        public Object getValueAt(int row, int column) {
+            SensitiveFileRow file = rows.get(row);
+            return switch (column) {
+                case 0 -> file.severity();
+                case 1 -> file.findings().size();
+                case 2 -> file.count(ReviewStatus.NEEDS_REVIEW);
+                case 3 -> file.count(ReviewStatus.REVIEWED);
+                case 4 -> file.count(ReviewStatus.FALSE_POSITIVE);
+                case 5 -> Finding.redactUrlValue(file.assetUrl());
+                default -> file.rules();
+            };
+        }
+    }
+
+    private record SensitiveFileRow(String assetUrl, Severity severity, List<Finding> findings, String rules) {
+        int count(ReviewStatus status) {
+            int count = 0;
+            for (Finding finding : findings) if (finding.reviewStatus() == status) count++;
+            return count;
+        }
+
+        Finding source() {
+            for (Finding finding : findings) if (finding.response() != null) return finding;
+            return findings.get(0);
+        }
     }
 
     static final class ResponsiveActionPanel extends JPanel {

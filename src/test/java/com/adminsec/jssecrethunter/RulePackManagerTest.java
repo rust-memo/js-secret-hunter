@@ -10,8 +10,8 @@ class RulePackManagerTest {
     @Test
     void loadsBundledVersionedRules() {
         RulePackManager manager = new RulePackManager();
-        assertEquals("2026.07.2", manager.current().version());
-        assertTrue(manager.current().rules().size() >= 35);
+        assertEquals("2026.07.4-burp", manager.current().version());
+        assertTrue(manager.current().rules().size() >= 49);
         assertEquals(64, manager.current().sha256().length());
     }
 

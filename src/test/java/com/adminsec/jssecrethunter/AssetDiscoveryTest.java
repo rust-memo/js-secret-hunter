@@ -51,4 +51,19 @@ class AssetDiscoveryTest {
         assertTrue(assets.stream().anyMatch(asset -> asset.url().equals("https://app.test/assets/runtime")));
         assertFalse(assets.stream().anyMatch(asset -> asset.url().equals("https://app.test/assets/react")));
     }
+
+    @Test
+    void discoversExportsWorkersAndInlineModuleImports() {
+        String js = "export { client } from './client.mjs'; new Worker('/workers/jobs.js');"
+                + "navigator.serviceWorker.register('../sw.js');";
+        Set<String> urls = discovery.discover("https://app.test/assets/app.js", js, false, true);
+        assertTrue(urls.contains("https://app.test/assets/client.mjs"));
+        assertTrue(urls.contains("https://app.test/workers/jobs.js"));
+        assertTrue(urls.contains("https://app.test/sw.js"));
+
+        String html = "<base href='/static/'><script type='module'>import './boot.js'; new SharedWorker('worker.js')</script>";
+        Set<String> inline = discovery.discover("https://app.test/page", html, true, false);
+        assertTrue(inline.contains("https://app.test/static/boot.js"));
+        assertTrue(inline.contains("https://app.test/static/worker.js"));
+    }
 }

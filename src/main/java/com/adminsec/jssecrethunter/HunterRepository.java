@@ -110,10 +110,19 @@ public final class HunterRepository {
     }
 
     public void setStatus(Finding finding, ReviewStatus status) {
-        finding.reviewStatus(status);
-        reviewed.remove(finding.fingerprint()); falsePositives.remove(finding.fingerprint());
-        if (status == ReviewStatus.REVIEWED) reviewed.add(finding.fingerprint());
-        if (status == ReviewStatus.FALSE_POSITIVE) falsePositives.add(finding.fingerprint());
+        if (finding == null) return;
+        setStatus(List.of(finding), status);
+    }
+
+    public void setStatus(Collection<Finding> selected, ReviewStatus status) {
+        if (selected == null || selected.isEmpty() || status == null) return;
+        for (Finding finding : selected) {
+            if (finding == null) continue;
+            finding.reviewStatus(status);
+            reviewed.remove(finding.fingerprint()); falsePositives.remove(finding.fingerprint());
+            if (status == ReviewStatus.REVIEWED) reviewed.add(finding.fingerprint());
+            if (status == ReviewStatus.FALSE_POSITIVE) falsePositives.add(finding.fingerprint());
+        }
         persist(); notifyListener();
     }
 

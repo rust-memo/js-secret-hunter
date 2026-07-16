@@ -15,5 +15,8 @@ public final class RuleDefinition {
     public double minEntropy = 0;
     public int minLength = 0;
     public String allowlistRegex = "";
+    public boolean sensitiveValue = false;
+    public String description = "";
+    public String remediation = "";
     public boolean enabled = true;
 }

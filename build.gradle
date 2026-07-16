@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.adminsec'
-version = '1.1.1'
+version = '1.3.0'
 
 repositories { mavenCentral() }
 
@@ -35,5 +35,7 @@ jar {
     archiveBaseName = 'js-secret-hunter'
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+    from('LICENSE') { into 'META-INF'; rename { 'LICENSE-js-secret-hunter.txt' } }
+    from('THIRD_PARTY_NOTICES.md') { into 'META-INF' }
     manifest { attributes('Main-Class': 'com.adminsec.jssecrethunter.JsSecretHunterExtension') }
 }

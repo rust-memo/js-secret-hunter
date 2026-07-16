@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "version": "2026.07.2",
-  "releasedAt": "2026-07-13",
+  "version": "2026.07.4-burp",
+  "releasedAt": "2026-07-16",
   "rules": [
     {
       "id": "aws-access-key-id",
@@ -290,6 +290,18 @@
       "secretGroup": 1
     },
     {
+      "id": "linkfinder-endpoint",
+      "name": "Quoted application endpoint",
+      "kind": "ENDPOINT",
+      "severity": "INFO",
+      "confidence": "LOW",
+      "keywords": [],
+      "regex": "(?i)[\"'`]((?:(?:https?:)?//[A-Za-z0-9.-]+\\.[A-Za-z]{2,}(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~!$&()*+,;=:@%/?#-]{0,1000})?|(?:/|\\.\\.?/)[A-Za-z0-9._~!$&()*+,;=:@%/?#-]{2,1000}|[A-Za-z0-9_-]+(?:/[A-Za-z0-9._~!$&()*+,;=:@%?#-]+)+\\.(?:php|asp|aspx|jsp|json|action|html?|xml|txt)(?:[?#][A-Za-z0-9._~!$&()*+,;=:@%/?#-]*)?))[\"'`]",
+      "secretGroup": 1,
+      "minLength": 3,
+      "allowlistRegex": "(?i)\\.(?:js|mjs|cjs|css|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot|map)(?:[?#].*)?$"
+    },
+    {
       "id": "internal-hostname-url",
       "name": "Internal or local service URL",
       "kind": "CONFIGURATION",
@@ -430,7 +442,105 @@
       "confidence": "HIGH",
       "keywords": ["sentry", "ingest.sentry.io"],
       "regex": "(?i)\\b(https://[0-9a-f]{16,64}(?::[0-9a-f]{16,64})?@[A-Za-z0-9.-]*sentry\\.io/[0-9]+)\\b",
-      "secretGroup": 1
+      "secretGroup": 1,
+      "sensitiveValue": true
+    },
+    {
+      "id": "dom-xss-html-sink",
+      "name": "Potential DOM XSS HTML injection sink",
+      "kind": "VULNERABILITY",
+      "severity": "HIGH",
+      "confidence": "LOW",
+      "keywords": ["innerhtml", "outerhtml", "insertadjacenthtml", "document.write"],
+      "regex": "(?i)\\b((?:innerHTML|outerHTML)\\s*=|insertAdjacentHTML\\s*\\(|document\\.write(?:ln)?\\s*\\()",
+      "secretGroup": 1,
+      "description": "A JavaScript HTML-writing sink was found. It becomes DOM XSS when attacker-controlled data can reach it without context-appropriate sanitization.",
+      "remediation": "Trace the value reaching this sink. Prefer textContent or safe DOM construction, and sanitize unavoidable HTML with a maintained policy-based sanitizer."
+    },
+    {
+      "id": "dynamic-code-execution-sink",
+      "name": "Dynamic JavaScript execution sink",
+      "kind": "VULNERABILITY",
+      "severity": "HIGH",
+      "confidence": "LOW",
+      "keywords": ["eval(", "new function"],
+      "regex": "(?i)\\b((?:eval\\s*\\(|new\\s+Function\\s*\\())",
+      "secretGroup": 1,
+      "description": "The application dynamically compiles or evaluates JavaScript. User-controlled input reaching this sink can lead to script execution.",
+      "remediation": "Remove eval and Function construction. Replace dynamic code with explicit parsing, dispatch tables, or structured data handling."
+    },
+    {
+      "id": "client-open-redirect-flow",
+      "name": "Potential client-side open redirect flow",
+      "kind": "VULNERABILITY",
+      "severity": "HIGH",
+      "confidence": "LOW",
+      "keywords": ["urlsearchparams", "location.search", "location.hash", "document.url"],
+      "regex": "(?is)\\b((?:window\\.)?location(?:\\.href)?\\s*=|(?:window\\.)?location\\.(?:assign|replace)\\s*\\()\\s*[^;\\r\\n]{0,240}(?:URLSearchParams|location\\.(?:search|hash)|document\\.URL)",
+      "secretGroup": 1,
+      "description": "A navigation sink appears to consume data derived from the current URL. Insufficient destination validation can create a client-side open redirect.",
+      "remediation": "Resolve destinations against a fixed trusted origin and allowlist exact paths or hosts. Reject scheme-relative, encoded, and non-HTTP destinations."
+    },
+    {
+      "id": "wildcard-postmessage-target",
+      "name": "Wildcard postMessage target origin",
+      "kind": "VULNERABILITY",
+      "severity": "MEDIUM",
+      "confidence": "MEDIUM",
+      "keywords": ["postmessage"],
+      "regex": "(?i)\\bpostMessage\\s*\\([^\\r\\n;]{0,500},\\s*(['\"]\\*['\"])\\s*\\)",
+      "secretGroup": 1,
+      "description": "A cross-window message is sent to every origin. A malicious page may receive sensitive message data if it can obtain a window reference.",
+      "remediation": "Use the exact expected target origin and validate both event.origin and event.source when receiving messages."
+    },
+    {
+      "id": "disabled-tls-verification",
+      "name": "TLS certificate verification disabled",
+      "kind": "VULNERABILITY",
+      "severity": "HIGH",
+      "confidence": "HIGH",
+      "keywords": ["rejectunauthorized", "node_tls_reject_unauthorized"],
+      "regex": "(?i)\\b((?:rejectUnauthorized\\s*[:=]\\s*false|NODE_TLS_REJECT_UNAUTHORIZED\\s*[:=]\\s*['\"]?0['\"]?))",
+      "secretGroup": 1,
+      "description": "The code disables TLS certificate verification, allowing a network attacker to impersonate upstream services.",
+      "remediation": "Keep certificate verification enabled. Configure the correct trust store or a narrowly scoped custom CA instead of bypassing validation."
+    },
+    {
+      "id": "sensitive-browser-storage",
+      "name": "Sensitive value stored in Web Storage",
+      "kind": "VULNERABILITY",
+      "severity": "MEDIUM",
+      "confidence": "MEDIUM",
+      "keywords": ["localstorage", "sessionstorage"],
+      "regex": "(?i)\\b(?:localStorage|sessionStorage)\\s*\\.\\s*setItem\\s*\\(\\s*['\"]((?:access|auth|id|refresh)[_-]?token|jwt|password|secret|session)['\"]",
+      "secretGroup": 1,
+      "description": "A key name associated with authentication or secrets is written to browser Web Storage, where any same-origin script can read it.",
+      "remediation": "Prefer Secure, HttpOnly, SameSite cookies for session credentials and keep short-lived sensitive state out of Web Storage."
+    },
+    {
+      "id": "prototype-pollution-dangerous-key",
+      "name": "Prototype-pollution dangerous property access",
+      "kind": "VULNERABILITY",
+      "severity": "MEDIUM",
+      "confidence": "LOW",
+      "keywords": ["__proto__", "constructor.prototype"],
+      "regex": "(?i)\\b(__proto__|constructor\\s*\\.\\s*prototype)\\b",
+      "secretGroup": 1,
+      "description": "A prototype-mutating property is referenced. Unsafe recursive merges or attacker-controlled property paths may make this exploitable.",
+      "remediation": "Reject __proto__, prototype, and constructor keys, use own-property checks, and update vulnerable merge or path-setting libraries."
+    },
+    {
+      "id": "cleartext-websocket-transport",
+      "name": "Cleartext WebSocket transport",
+      "kind": "VULNERABILITY",
+      "severity": "MEDIUM",
+      "confidence": "HIGH",
+      "keywords": ["ws://"],
+      "regex": "(?i)\\b(ws://[^\\s'\"<>]{3,1000})",
+      "secretGroup": 1,
+      "sensitiveValue": true,
+      "description": "A cleartext WebSocket endpoint exposes traffic to interception and modification when it is reachable over an untrusted network.",
+      "remediation": "Use wss:// with valid certificate verification and reject insecure transport in production configurations."
     }
   ]
 }

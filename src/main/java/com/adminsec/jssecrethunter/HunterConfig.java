@@ -2,8 +2,13 @@ package com.adminsec.jssecrethunter;
 
 import burp.api.montoya.persistence.Preferences;
 
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.Optional;
+
 public final class HunterConfig {
     private static final String PREFIX = "jsSecretHunter.";
+    private static final String DEFAULT_ASSET_EXCLUSIONS = "jquery, google-analytics, gpt.js";
     private boolean autoFetch = true;
     private int maxDepth = 3;
     private int maxAssetsPerRoot = 500;
@@ -15,8 +20,9 @@ public final class HunterConfig {
     private int workers = 4;
     private int perHost = 2;
     private int timeoutSeconds = 15;
-    private ScanScope scanScope = ScanScope.TARGET_SCOPE;
+    private ScanScope scanScope = ScanScope.ALL_TRAFFIC;
     private boolean annotateHistory;
+    private String assetExclusions = DEFAULT_ASSET_EXCLUSIONS;
 
     public static HunterConfig load(Preferences p) {
         HunterConfig c = new HunterConfig();
@@ -31,8 +37,13 @@ public final class HunterConfig {
         c.workers = integer(p, "workers", 4, 1, 16);
         c.perHost = integer(p, "perHost", 2, 1, 8);
         c.timeoutSeconds = integer(p, "timeout", 15, 3, 120);
-        c.scanScope = bool(p, "targetScopeOnly", true) ? ScanScope.TARGET_SCOPE : ScanScope.ALL_TRAFFIC;
+        // This key intentionally supersedes the old targetScopeOnly preference. Version 1.1.1
+        // stored targetScopeOnly=true by default, which would otherwise keep hiding History
+        // results after upgrading. Passive analysis is local, while network fetching remains
+        // independently restricted to Target Scope in ScannerService.
+        c.scanScope = bool(p, "scanAllHistory", true) ? ScanScope.ALL_TRAFFIC : ScanScope.TARGET_SCOPE;
         c.annotateHistory = bool(p, "annotateHistory", false);
+        c.assetExclusions = string(p, "assetExclusions", DEFAULT_ASSET_EXCLUSIONS);
         return c;
     }
 
@@ -48,8 +59,10 @@ public final class HunterConfig {
         p.setInteger(PREFIX + "workers", workers);
         p.setInteger(PREFIX + "perHost", perHost);
         p.setInteger(PREFIX + "timeout", timeoutSeconds);
+        p.setBoolean(PREFIX + "scanAllHistory", scanScope == ScanScope.ALL_TRAFFIC);
         p.setBoolean(PREFIX + "targetScopeOnly", scanScope == ScanScope.TARGET_SCOPE);
         p.setBoolean(PREFIX + "annotateHistory", annotateHistory);
+        p.setString(PREFIX + "assetExclusions", assetExclusions);
     }
 
     private static boolean bool(Preferences p, String key, boolean fallback) {
@@ -57,6 +70,10 @@ public final class HunterConfig {
     }
     private static int integer(Preferences p, String key, int fallback, int min, int max) {
         Integer v = p.getInteger(PREFIX + key); return Math.max(min, Math.min(max, v == null ? fallback : v));
+    }
+    private static String string(Preferences p, String key, String fallback) {
+        String value = p.getString(PREFIX + key);
+        return value == null ? fallback : value;
     }
 
     public boolean autoFetch() { return autoFetch; }
@@ -82,7 +99,22 @@ public final class HunterConfig {
     public int timeoutSeconds() { return timeoutSeconds; }
     public void timeoutSeconds(int v) { timeoutSeconds = Math.max(3, Math.min(120, v)); }
     public ScanScope scanScope() { return scanScope; }
-    public void scanScope(ScanScope value) { scanScope = value == null ? ScanScope.TARGET_SCOPE : value; }
+    public void scanScope(ScanScope value) { scanScope = value == null ? ScanScope.ALL_TRAFFIC : value; }
     public boolean annotateHistory() { return annotateHistory; }
     public void annotateHistory(boolean value) { annotateHistory = value; }
+    public String assetExclusions() { return assetExclusions; }
+    public void assetExclusions(String value) {
+        assetExclusions = value == null ? "" : value.replace('\r', ' ').strip();
+        if (assetExclusions.length() > 4_000) assetExclusions = assetExclusions.substring(0, 4_000);
+    }
+
+    public Optional<String> assetExclusionFor(String url) {
+        if (url == null || url.isBlank() || assetExclusions.isBlank()) return Optional.empty();
+        String candidate = url.toLowerCase(Locale.ROOT);
+        return Arrays.stream(assetExclusions.split("[,\\n]"))
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .filter(value -> candidate.contains(value.toLowerCase(Locale.ROOT)))
+                .findFirst();
+    }
 }

@@ -17,9 +17,13 @@ import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -108,8 +112,8 @@ public final class ScannerService {
             }
             if (history.isEmpty()) {
                 stateMessage = config.scanScope() == ScanScope.TARGET_SCOPE
-                        ? "No in-scope history responses. Add the target to Target Scope or disable scope-only analysis in Settings."
-                        : "No matching responses were found in Proxy history.";
+                        ? "No in-scope history responses. Add the target to Target Scope or enable all-History analysis in Settings."
+                        : "No responses were found in Proxy History.";
             }
             for (ProxyHttpRequestResponse item : history) {
                 if (stopping.get() || generation != epoch.get()) return;
@@ -185,18 +189,19 @@ public final class ScannerService {
 
     private void process(Work work) {
         if (stopping.get() || work.epoch != epoch.get() || !waitIfPaused(work.epoch)) return;
-        String processKey = work.rootUrl + "\n" + canonical(work.url) + "\n" + work.response.statusCode() + "\n" + work.response.body().length();
-        if (!processed.add(processKey)) return;
         ContentClass contentClass = classify(work.request, work.response, work.url, work.hint);
-        if (contentClass == ContentClass.BINARY) {
-            if (work.epoch == epoch.get()) repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SKIPPED, "Non-text response"), work.epoch);
-            return;
-        }
         int limit = switch (contentClass) {
             case SOURCE_MAP -> config.maxMapBytes();
             case JAVASCRIPT -> config.maxJsBytes();
             default -> config.maxTextBytes();
         };
+        int fingerprintLimit = contentClass == ContentClass.BINARY ? 0 : limit;
+        String processKey = work.rootUrl + "\n" + canonical(work.url) + "\n" + responseFingerprint(work.response, fingerprintLimit);
+        if (!processed.add(processKey)) return;
+        if (contentClass == ContentClass.BINARY) {
+            if (work.epoch == epoch.get()) repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SKIPPED, "Non-text response"), work.epoch);
+            return;
+        }
         String body = TextBody.decode(work.response, limit);
         if (body == null) {
             if (work.epoch == epoch.get()) repository.upsertAsset(asset(work, AssetRecord.AssetStatus.SKIPPED, "Unsupported encoding or size limit"), work.epoch);
@@ -239,14 +244,25 @@ public final class ScannerService {
                     observed.request, observed.response, parent.epoch, true, link.contentClass()));
             return;
         }
-        if (!config.autoFetch()) return;
         HttpRequest scopeProbe;
         try { scopeProbe = HttpRequest.httpRequestFromUrl(link.url()); }
         catch (RuntimeException invalid) { return; }
+        if (!config.autoFetch()) {
+            repository.upsertAsset(new AssetRecord(link.url(), parent.url, parent.rootUrl, parent.depth + 1, chain,
+                    AssetRecord.AssetStatus.SKIPPED, link.source() + "; automatic fetch disabled", scopeProbe, null, Instant.now()), parent.epoch);
+            return;
+        }
         if (!inScope(scopeProbe)) {
             if (parent.epoch != epoch.get()) return;
             repository.upsertAsset(new AssetRecord(link.url(), parent.url, parent.rootUrl, parent.depth + 1, chain,
                     AssetRecord.AssetStatus.SKIPPED, "Outside Target Scope", scopeProbe, null, Instant.now()), parent.epoch);
+            return;
+        }
+        var exclusion = config.assetExclusionFor(link.url());
+        if (exclusion.isPresent()) {
+            repository.upsertAsset(new AssetRecord(link.url(), parent.url, parent.rootUrl, parent.depth + 1, chain,
+                    AssetRecord.AssetStatus.SKIPPED, link.source() + "; excluded by asset pattern: " + exclusion.get(),
+                    scopeProbe, null, Instant.now()), parent.epoch);
             return;
         }
         if (!scheduled.add(rootKey)) return;
@@ -471,6 +487,32 @@ public final class ScannerService {
     private static String canonical(String url) {
         try { URI u = URI.create(url); return new URI(u.getScheme(), u.getUserInfo(), u.getHost(), u.getPort(), u.getPath(), u.getQuery(), null).toString(); }
         catch (Exception invalid) { return url; }
+    }
+    static String responseFingerprint(HttpResponse response) {
+        return responseFingerprint(response, Integer.MAX_VALUE);
+    }
+    private static String responseFingerprint(HttpResponse response, int maximumBodyBytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(Short.toString(response.statusCode()).getBytes(StandardCharsets.UTF_8));
+            for (String name : List.of("Content-Type", "Content-Encoding")) {
+                String value = response.hasHeader(name) ? response.headerValue(name) : null;
+                if (value != null) digest.update(value.toLowerCase(Locale.ROOT).getBytes(StandardCharsets.UTF_8));
+            }
+            if (response.body() != null) {
+                int length = response.body().length();
+                digest.update(Integer.toString(length).getBytes(StandardCharsets.UTF_8));
+                if (length <= Math.max(0, maximumBodyBytes)) {
+                    try {
+                        byte[] body = response.body().getBytes();
+                        if (body != null) digest.update(body);
+                    } catch (RuntimeException unavailable) {
+                        // Length and response metadata still provide a stable fallback for file-backed messages.
+                    }
+                }
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); }
     }
     private static String host(String url) {
         try { String host = URI.create(url).getHost(); return host == null ? "unknown" : host.toLowerCase(Locale.ROOT); }

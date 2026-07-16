@@ -70,6 +70,20 @@ class HunterRepositoryTest {
     }
 
     @Test
+    void updatesEveryFindingInAFileWithOneReviewAction() {
+        HunterRepository repository = new HunterRepository(null);
+        Finding first = finding("secret-value-one-123456789");
+        Finding second = finding("secret-value-two-123456789");
+        repository.addFindings(List.of(first, second));
+
+        repository.setStatus(List.of(first, second), ReviewStatus.FALSE_POSITIVE);
+
+        assertEquals(ReviewStatus.FALSE_POSITIVE, first.reviewStatus());
+        assertEquals(ReviewStatus.FALSE_POSITIVE, second.reviewStatus());
+        assertEquals(2, repository.snapshot().findings().size());
+    }
+
+    @Test
     void rejectsWritesFromAnObsoleteScanGeneration() {
         HunterRepository repository = new HunterRepository(null);
         repository.activeGeneration(2);

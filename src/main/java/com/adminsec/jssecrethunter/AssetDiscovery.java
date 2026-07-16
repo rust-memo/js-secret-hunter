@@ -15,7 +15,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class AssetDiscovery {
-    private static final Pattern IMPORT = Pattern.compile("(?is)(?:import\\s*(?:[^'\\\"]*?\\sfrom\\s*)?|import\\s*\\(|require\\s*\\()\\s*['\\\"]([^'\\\"]+)['\\\"]");
+    private static final Pattern IMPORT = Pattern.compile("(?is)(?:(?:import|export)\\s+(?:[^'\\\"]*?\\sfrom\\s*)?|import\\s*\\(|require\\s*\\()\\s*['\\\"]([^'\\\"]+)['\\\"]");
+    private static final Pattern WORKER = Pattern.compile("(?is)(?:new\\s+(?:Shared)?Worker\\s*\\(|serviceWorker\\s*\\.\\s*register\\s*\\()\\s*['\\\"]([^'\\\"]+)['\\\"]");
     private static final Pattern SOURCE_MAP = Pattern.compile("(?im)[#@]\\s*sourceMappingURL\\s*=\\s*([^\\s*]+)");
     private static final Pattern JS_URL = Pattern.compile("(?i)(?:https?:)?//[^\\s'\\\"<>]+?\\.(?:m?js|cjs)(?:\\?[^\\s'\\\"<>]*)?|(?:[./][^\\s'\\\"<>]*?\\.(?:m?js|cjs)(?:\\?[^\\s'\\\"<>]*)?)");
     private static final Pattern MAP_URL = Pattern.compile("(?i)(?:https?:)?//[^\\s'\\\"<>]+?\\.map(?:\\?[^\\s'\\\"<>]*)?|(?:[./][^\\s'\\\"<>]*?\\.map(?:\\?[^\\s'\\\"<>]*)?)");
@@ -34,6 +35,10 @@ public final class AssetDiscovery {
             for (Element script : document.select("script[src]")) {
                 add(raw, script.absUrl("src"), script.attr("src"), ContentClass.JAVASCRIPT, "script[src]");
             }
+            for (Element script : document.select("script:not([src])")) {
+                collectResolved(IMPORT, script.data(), 1, script.baseUri(), raw, "inline script import");
+                collectResolved(WORKER, script.data(), 1, script.baseUri(), raw, "inline worker");
+            }
             for (Element link : document.select("link[href]")) {
                 String rel = link.attr("rel").toLowerCase(Locale.ROOT);
                 String as = link.attr("as").toLowerCase(Locale.ROOT);
@@ -44,6 +49,7 @@ public final class AssetDiscovery {
         }
         if (javascript) {
             collect(IMPORT, body, 1, raw, ContentClass.JAVASCRIPT, "static import");
+            collect(WORKER, body, 1, raw, ContentClass.JAVASCRIPT, "worker script");
             collect(SOURCE_MAP, body, 1, raw, ContentClass.SOURCE_MAP, "sourceMappingURL");
             collect(MAP_URL, body, 0, raw, ContentClass.SOURCE_MAP, "source map URL");
         }
@@ -79,6 +85,19 @@ public final class AssetDiscovery {
             String value = matcher.group(group);
             if ("static import".equals(source) && !isResolvableImport(value)) continue;
             add(out, null, value, contentClass, source);
+        }
+    }
+
+    private static void collectResolved(Pattern pattern, String text, int group, String base,
+                                        Map<String, RawAsset> out, String source) {
+        if (text == null || text.isBlank()) return;
+        Matcher matcher = pattern.matcher(text);
+        int count = 0;
+        while (matcher.find() && count++ < 2_000) {
+            String value = matcher.group(group);
+            if ("inline script import".equals(source) && !isResolvableImport(value)) continue;
+            String resolved = resolve(base, clean(value));
+            if (resolved != null) add(out, resolved, value, ContentClass.JAVASCRIPT, source);
         }
     }
 

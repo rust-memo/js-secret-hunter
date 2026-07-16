@@ -21,9 +21,13 @@ final class BurpIntegration {
 
     static AuditIssue auditIssue(Finding finding) {
         String detail = detail(finding);
-        String remediation = "Remove sensitive values from client-accessible content, rotate exposed credentials, "
-                + "and move secrets to a server-side secret store. Restrict any affected credential to the minimum required privileges.";
-        String background = "Client-accessible JavaScript and text responses can disclose credentials, internal endpoints, and configuration data.";
+        String remediation = finding.remediation().isBlank()
+                ? "Remove sensitive values from client-accessible content, rotate exposed credentials, "
+                    + "and move secrets to a server-side secret store. Restrict any affected credential to the minimum required privileges."
+                : finding.remediation();
+        String background = finding.kind() == com.adminsec.jssecrethunter.model.FindingKind.VULNERABILITY
+                ? "Static client-side analysis can identify security-sensitive sinks and configurations. Each candidate requires manual data-flow and exploitability review."
+                : "Client-accessible JavaScript and text responses can disclose credentials, internal endpoints, and configuration data.";
         HttpRequestResponse message = HttpRequestResponse.httpRequestResponse(finding.request(), finding.response());
         AuditIssueSeverity severity = severity(finding.severity());
         return AuditIssue.auditIssue("JS Secret Hunter: " + finding.ruleName(), detail, remediation,
@@ -38,6 +42,7 @@ final class BurpIntegration {
                 + "<li>SHA-256: <code>" + html(finding.valueFingerprint()) + "</code></li>"
                 + "<li>Asset: <code>" + html(finding.assetUrl()) + "</code></li>"
                 + "<li>Line: " + finding.line() + "</li></ul>"
+                + (finding.description().isBlank() ? "" : "<p>" + html(finding.description()) + "</p>")
                 + "<p>The value is intentionally redacted. Review the attached response in Burp.</p>";
     }
 

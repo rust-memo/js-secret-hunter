@@ -50,9 +50,13 @@ class HunterPanelActionTest {
         Set<String> findingActions = Set.of("Reveal", "Copy value", "Send to Repeater", "Reviewed", "False positive",
                 "Needs review", "Ignore rule", "Ignore host", "Add as Burp issue", "Export JSON", "Export CSV", "Export full…");
         assertTrue(labels.containsAll(findingActions));
+        assertTrue(labels.contains("Copy redacted URL"));
+        assertTrue(labels.contains("Send endpoint to Repeater"));
         assertEquals(12, findingActions.size());
         JTabbedPane tabs = (JTabbedPane) panel.getComponent(0);
+        assertEquals("Overview", tabs.getTitleAt(0));
         assertTrue(java.util.stream.IntStream.range(0, tabs.getTabCount()).anyMatch(index -> "Links".equals(tabs.getTitleAt(index))));
+        assertTrue(java.util.stream.IntStream.range(0, tabs.getTabCount()).anyMatch(index -> "Sensitive Files".equals(tabs.getTitleAt(index))));
         for (JButton button : buttons) {
             if (Set.of("Reveal", "Copy value", "Send to Repeater", "Reviewed", "False positive", "Needs review",
                     "Ignore rule", "Ignore host", "Add as Burp issue").contains(button.getText())) assertFalse(button.isEnabled());
@@ -62,11 +66,30 @@ class HunterPanelActionTest {
         repository.addFindings(List.of(new Finding("api-endpoint", "API endpoint", FindingKind.ENDPOINT,
                 Severity.INFO, Confidence.HIGH, request.url(), request.url(), List.of(request.url()),
                 1, 0, 7, "endpoint", "/api/v1", request, null)));
-        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
-        while (panel.linkCount() != 1 && System.nanoTime() < deadline) {
+        long endpointDeadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+        while (panel.linkCount() != 1 && System.nanoTime() < endpointDeadline) {
             Thread.sleep(20); SwingUtilities.invokeAndWait(() -> {});
         }
         assertEquals(1, panel.linkCount());
+        assertEquals(0, panel.sensitiveFileCount(), "endpoint-only files should stay in Links, not Sensitive Files");
+        repository.addFindings(List.of(new Finding("hardcoded-token", "Hardcoded token", FindingKind.SECRET,
+                Severity.HIGH, Confidence.HIGH, request.url(), request.url(), List.of(request.url()),
+                2, 8, 32, "token", "secret-value-for-review-1234", request, null)));
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+        while ((panel.linkCount() != 1 || panel.sensitiveFileCount() != 1) && System.nanoTime() < deadline) {
+            Thread.sleep(20); SwingUtilities.invokeAndWait(() -> {});
+        }
+        assertEquals(1, panel.sensitiveFileCount());
+    }
+
+    @Test
+    void resolvesRelativeDetectedLinksAgainstTheirSourceAsset() {
+        HttpRequest request = mock(HttpRequest.class);
+        when(request.url()).thenReturn("https://app.test/static/app.js");
+        Finding finding = new Finding("linkfinder-endpoint", "Quoted application endpoint", FindingKind.ENDPOINT,
+                Severity.INFO, Confidence.LOW, request.url(), request.url(), List.of(request.url()),
+                1, 0, 16, "endpoint", "../api/users?id=1", request, null);
+        assertEquals("https://app.test/api/users?id=1", HunterPanel.resolveDetectedLink(finding));
     }
 
     private static List<JButton> buttons(Component root) {

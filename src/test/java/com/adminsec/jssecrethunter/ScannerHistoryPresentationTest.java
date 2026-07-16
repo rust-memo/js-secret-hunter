@@ -43,7 +43,9 @@ class ScannerHistoryPresentationTest {
             ProxyHistoryFilter filter = invocation.getArgument(0);
             return filter.matches(item) ? List.of(item) : List.of();
         });
-        ScannerService scanner = new ScannerService(api, new HunterConfig(), new HunterRepository(null), mock(DetectionEngine.class));
+        HunterConfig config = new HunterConfig();
+        config.scanScope(ScanScope.TARGET_SCOPE);
+        ScannerService scanner = new ScannerService(api, config, new HunterRepository(null), mock(DetectionEngine.class));
         CountDownLatch complete = new CountDownLatch(1);
         scanner.stateListener(state -> {
             if (state.message().startsWith("No in-scope history responses")) complete.countDown();
